@@ -6173,9 +6173,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
               const attempt = (context.capacityRetryAttempt ?? 0) + 1;
               context.capacityRetryAttempt = attempt;
-              context.capacityRetryPending = yield* Deferred.make<
-                ActiveCodexTurnContext | undefined
-              >();
+              const pending = yield* Deferred.make<ActiveCodexTurnContext | undefined>();
+              context.capacityRetryPending = pending;
               const retryDelayMs = Math.min(2_000 * 2 ** (attempt - 1), 30_000);
               const now = yield* DateTime.now;
               const previous = (yield* Ref.get(providerRetries)).get(context.providerTurnId);
@@ -6238,11 +6237,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     ).pipe(
                       Effect.catch((cause) =>
                         Effect.gen(function* () {
-                          if (
-                            context.capacityRetryPending !== undefined &&
-                            (yield* Deferred.isDone(context.capacityRetryPending))
-                          )
-                            return;
+                          if (yield* Deferred.isDone(pending)) return;
                           yield* Effect.logWarning(
                             "orchestration-v2.codex-capacity-retry-start-failed",
                             {
@@ -6260,9 +6255,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                               yield* DateTime.now,
                             ),
                           });
-                          if (context.capacityRetryPending !== undefined) {
-                            yield* Deferred.succeed(context.capacityRetryPending, undefined);
-                          }
+                          yield* Deferred.succeed(pending, undefined);
                           yield* turnTerminalizationPermit.withPermits(1)(
                             emitOrDeferRootTerminal({ ...terminal, providerRetry: state }),
                           );
