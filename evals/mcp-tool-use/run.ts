@@ -1854,7 +1854,7 @@ const main = Effect.gen(function* () {
   );
   yield* fs.makeDirectory(out, { recursive: true });
   const lines = yield* Effect.forEach(rows, (row) => encodeJson(row));
-  yield* fs.writeFileString(path.join(out, "results.ndjson"), `${lines.join("\n")}\n`);
+  yield* fs.writeFileString(path.join(out, "results.jsonl"), `${lines.join("\n")}\n`);
   yield* fs.writeFileString(path.join(out, "summary.md"), summary);
   yield* Effect.log(`Wrote ${rows.length} samples to ${out}.\n\n${summary}`);
 });
