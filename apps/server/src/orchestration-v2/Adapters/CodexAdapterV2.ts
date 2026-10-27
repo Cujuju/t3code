@@ -6014,11 +6014,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 // Only direct children wake an idle root turn; grandchildren report to their
                 // own parent, and running root turns receive results natively.
                 const parent = input.context.subagent.parentContext;
+                const parentNativeThreadId = parent.providerThread.nativeThreadRef?.nativeId;
                 if (
                   continuationRequests !== undefined &&
                   parent.subagent === null &&
                   (input.status === "completed" || input.status === "failed") &&
                   !(yield* Ref.get(terminalizedNonCompletedNativeTurns)).has(parent.nativeTurnId) &&
+                  (parentNativeThreadId == null ||
+                    !capacityContinuations.has(parentNativeThreadId)) &&
                   ![...(yield* Ref.get(activeTurns)).values()].some(
                     (active) =>
                       active.subagent === null &&
@@ -7019,14 +7022,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           interruptTurn: Effect.fn("CodexAdapterV2.interruptTurn")(
             function* (requestedInput) {
               const nativeThreadId = requestedInput.providerThread.nativeThreadRef?.nativeId;
-              const startingRetry =
+              const capacityRetry =
                 nativeThreadId == null
                   ? undefined
                   : capacityContinuations.get(nativeThreadId)?.context;
-              if (
-                startingRetry?.providerTurnId === latestRunTurnId(requestedInput.providerTurnId) &&
-                startingRetry.capacityRetryPending !== undefined
-              ) {
+              const startingRetry =
+                capacityRetry?.providerTurnId === latestRunTurnId(requestedInput.providerTurnId)
+                  ? capacityRetry
+                  : undefined;
+              if (startingRetry?.capacityRetryPending !== undefined) {
                 const started = yield* Deferred.await(startingRetry.capacityRetryPending).pipe(
                   Effect.timeoutOption("10 seconds"),
                 );
@@ -7034,7 +7038,6 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   return yield* toProtocolError(
                     "Codex did not start the capacity retry within 10 seconds; Stop could not be delivered.",
                   );
-                if (started.value === undefined) return;
               }
               const { turnInput, goalTurns } = yield* resolveGoalStopTarget(requestedInput);
               const [activeTurnContexts, settledTurnContexts] =
@@ -7056,7 +7059,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     )
                   : undefined);
               const lineageRoots = Array.from(
-                new Set([...(activeTurn === undefined ? [] : [activeTurn]), ...goalTurns]),
+                new Set([
+                  ...(activeTurn === undefined ? [] : [activeTurn]),
+                  ...(startingRetry === undefined ? [] : [startingRetry]),
+                  ...goalTurns,
+                ]),
               );
               const inLineage = (context: ActiveCodexTurnContext) =>
                 lineageRoots.some(
