@@ -150,7 +150,13 @@ describe("pools", () => {
     const input = new Map([
       [
         EnvironmentId.make("env-a"),
-        { ...laptop, serverConfig: { providers: [native], usageLimitSources: [{ ...source, accounts: [unread] }] } },
+        {
+          ...laptop,
+          serverConfig: {
+            providers: [native],
+            usageLimitSources: [{ ...source, accounts: [unread] }],
+          },
+        },
       ],
     ]);
     const accounts = collectLimitAccounts(input);
@@ -932,7 +938,10 @@ describe("/usage-limits", () => {
   it("shows the hub's reading of the selected account instead of a fresher native one", () => {
     const fresher = provider({
       ...selected,
-      usageLimits: { checkedAt: "2026-09-03T11:30:00.000Z", windows: [{ ...window, usedPercent: 90 }] },
+      usageLimits: {
+        checkedAt: "2026-09-03T11:30:00.000Z",
+        windows: [{ ...window, usedPercent: 90 }],
+      },
     });
     const report = collectProviderUsageLimits(fresher.instanceId, [fresher], sources, now);
     expect(report?.accounts[0]?.id).toBe(fresher.instanceId);
