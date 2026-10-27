@@ -172,7 +172,10 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
   const accounts = new Map<string, LimitAccount>();
   const creditSources = new Map<string, LimitAccount>();
   const hubRedeems = new Map<string, LimitAccount>();
-  const merge = (key: string, next: LimitAccount) => {
+  // A hub reads each account with its own credential. A native reading can carry another account's
+  // numbers when its provider runs through that hub, because rate-limit events follow the routed account.
+  const hubLimits = new Set<string>();
+  const merge = (key: string, next: LimitAccount, fromHub: boolean) => {
     // Prefer hub redemption to clear its routing cooldown too; displayed balance still follows the freshest read.
     const previousHub = hubRedeems.get(key);
     if (
@@ -203,7 +206,7 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
           !previous.environments.some((seen) => seen.environmentId === candidate.environmentId),
       ),
     ];
-    const winner = fresher ? next : previous;
+    const winner = fromHub && !hubLimits.has(key) ? next : fresher ? next : previous;
     const creditSource = creditSources.get(key);
     accounts.set(key, {
       ...previous,
@@ -246,7 +249,7 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
         sourceLabel: null,
         redeem: { environmentId, input: { instanceId: provider.instanceId } },
         limits: provider.usageLimits,
-      });
+      }, false);
     }
   }
   const labelEnvironment = presentations.size > 1;
@@ -258,7 +261,8 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
       for (const account of source.accounts) {
         if (limitsNotice(account.usageLimits) !== null) continue;
         const key = `${source.id}:${account.id}${account.workspaceId ? `:${account.workspaceId}` : ""}`;
-        merge(resolveKey(account) ?? key, {
+        const accountKey = resolveKey(account) ?? key;
+        merge(accountKey, {
           key,
           driver: account.driver,
           displayName: account.email ? null : account.id.replace(/\.json$/i, ""),
@@ -278,7 +282,8 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
               }
             : null,
           limits: account.usageLimits,
-        });
+        }, true);
+        hubLimits.add(accountKey);
       }
     }
   }
@@ -714,6 +719,15 @@ export function collectProviderUsageLimits(
         (a, b) =>
           Date.parse(b.account.usageLimits.checkedAt) - Date.parse(a.account.usageLimits.checkedAt),
       )[0];
+    // Same rule as collectLimitAccounts: the hub's read of this account beats the native one.
+    const hubUsage = sources
+      .flatMap((source) => source.accounts)
+      .filter(
+        (account) =>
+          key !== null && resolveKey(account) === key && !limitsNotice(account.usageLimits),
+      )
+      .sort((a, b) => Date.parse(b.usageLimits.checkedAt) - Date.parse(a.usageLimits.checkedAt))[0];
+    const shownLimits = hubUsage ? hubUsage.usageLimits : limits;
     const hubCreditId = hubCredits?.account.usageLimits.resetCredits?.nextCreditId;
     const showHubCredits =
       hubCredits &&
@@ -740,7 +754,7 @@ export function collectProviderUsageLimits(
       ...(provider.displayName ? { displayName: provider.displayName } : {}),
       ...(provider.accentColor ? { accentColor: provider.accentColor } : {}),
       ...(provider.auth.email ? { email: provider.auth.email } : {}),
-      limits: shownCredits ? { ...limits, resetCredits: shownCredits } : limits,
+      limits: shownCredits ? { ...shownLimits, resetCredits: shownCredits } : shownLimits,
     });
   }
   for (const source of sources) {

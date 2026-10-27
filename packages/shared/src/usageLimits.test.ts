@@ -78,7 +78,7 @@ describe("pools", () => {
   };
   const laptop = { entry: { target: { label: "Laptop" } } };
 
-  it("merges one account reported natively on two environments and by a hub into one entry", () => {
+  it("merges one account reported natively on two environments and by a hub into one entry with the hub's reading", () => {
     const native = provider({
       driver: claude,
       instanceId: ProviderInstanceId.make("claude"),
@@ -130,7 +130,32 @@ describe("pools", () => {
         { environmentId: "env-b", label: "Desktop" },
       ],
     });
-    expect(accounts[0]?.limits.windows[0]?.usedPercent).toBe(55);
+    // The hub read this account with its own credential; the fresher native read may be another routed account's.
+    expect(accounts[0]?.limits.windows[0]?.usedPercent).toBe(10);
+  });
+
+  it("keeps the native reading when the hub cannot read the account", () => {
+    const native = provider({
+      driver: claude,
+      instanceId: ProviderInstanceId.make("claude"),
+      auth: { status: "authenticated", email: "same@example.com" },
+      usageLimits: { checkedAt, windows: [{ ...window, usedPercent: 40 }] },
+    });
+    const unread = {
+      id: "claude-same@example.com.json",
+      driver: claude,
+      email: "same@example.com",
+      usageLimits: { checkedAt, windows: [], unavailable: { reason: "probeFailed" as const } },
+    };
+    const input = new Map([
+      [
+        EnvironmentId.make("env-a"),
+        { ...laptop, serverConfig: { providers: [native], usageLimitSources: [{ ...source, accounts: [unread] }] } },
+      ],
+    ]);
+    const accounts = collectLimitAccounts(input);
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]?.limits.windows[0]?.usedPercent).toBe(40);
   });
 
   it("merges OpenCode Go limits from machines with the same API key", () => {
@@ -904,6 +929,16 @@ describe("/usage-limits", () => {
     },
   ];
 
+  it("shows the hub's reading of the selected account instead of a fresher native one", () => {
+    const fresher = provider({
+      ...selected,
+      usageLimits: { checkedAt: "2026-09-03T11:30:00.000Z", windows: [{ ...window, usedPercent: 90 }] },
+    });
+    const report = collectProviderUsageLimits(fresher.instanceId, [fresher], sources, now);
+    expect(report?.accounts[0]?.id).toBe(fresher.instanceId);
+    expect(report?.accounts[0]?.limits.windows[0]?.usedPercent).toBe(window.usedPercent);
+  });
+
   it("uses hub credit balances and redemption targets in the composer, including native duplicates", () => {
     const hubs = sources.map((source) => ({
       ...source,
@@ -1068,8 +1103,13 @@ describe("/usage-limits", () => {
       },
     });
     const duplicates = [failed, staleCredit, credited, freshest];
+    // Without a hub read of this account, so native duplicates decide.
+    const otherAccounts = sources.map((source) => ({
+      ...source,
+      accounts: source.accounts.filter((account) => account.id !== "duplicate"),
+    }));
     for (const providers of [duplicates, duplicates.toReversed()]) {
-      const report = collectProviderUsageLimits(failed.instanceId, providers, sources, now);
+      const report = collectProviderUsageLimits(failed.instanceId, providers, otherAccounts, now);
       expect(report?.accounts.map((account) => account.id)).toEqual(["codex-fresh", "hub:oss"]);
       expect(report?.accounts[0]).toMatchObject({
         limits: {
