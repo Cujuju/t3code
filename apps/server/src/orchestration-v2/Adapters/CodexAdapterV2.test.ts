@@ -2223,6 +2223,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     "stop-starting",
     "started-first",
     "completed-first",
+    "new-run",
     "steer",
     "start-fails",
   ] as const)("handles terminal Codex capacity failures when retries %s", (outcome) =>
@@ -2283,7 +2284,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           if (
             outcome === "started-first" ||
             outcome === "stop-starting" ||
-            outcome === "completed-first"
+            outcome === "completed-first" ||
+            outcome === "new-run"
           ) {
             start.splice(1, 0, ...start.splice(2, 1));
           }
@@ -2308,7 +2310,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                 },
               });
             } else if (entry.type === "emit_inbound" && entry.label === "turn/start") {
-              if (outcome === "completed-first")
+              if (outcome === "completed-first" || outcome === "new-run")
                 entries.push({
                   type: "emit_inbound",
                   frame: {
@@ -2319,6 +2321,18 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                     },
                   },
                 });
+              if (outcome === "new-run") {
+                entries.push(
+                  ...codexReplayPreamble({
+                    nativeThreadId,
+                    nativeTurnId: nativeTurnId(2),
+                    prompt: "Next task.",
+                  })
+                    .slice(-3)
+                    .map((next, index) => (index < 2 ? withReplayRequestId(next, 5) : next)),
+                  ...failureEntries(2),
+                );
+              }
               entries.push(
                 outcome === "start-fails"
                   ? {
@@ -2491,6 +2505,19 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           }
         }
         yield* harness.awaitTerminal(1);
+        if (outcome === "new-run") {
+          assert.equal((yield* Queue.take(milestones)).type, "turn.terminal");
+          yield* harness.runtime.startTurn({
+            ...turnInput,
+            attemptId: RunAttemptId.make("capacity-next-task"),
+            message: { ...turnInput.message, text: "Next task." },
+          });
+          const nextRetry = yield* Queue.take(milestones);
+          assert.equal(nextRetry.type, "turn_item.updated");
+          if (nextRetry.type !== "turn_item.updated" || nextRetry.turnItem.type !== "error") return;
+          assert.equal(nextRetry.turnItem.retry?.attempt, 1);
+          return;
+        }
         const terminal = harness.terminalEvents()[0];
         assert.equal(
           terminal?.status,
@@ -5410,101 +5437,105 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     };
   };
 
-  it.effect.each(["completed", "failed", "interrupted", "starting"] as const)(
+  it.effect.each(["completed", "failed", "interrupted", "starting", "replied-last"] as const)(
     "handles a late native child after the capacity retry %s",
     (parentStatus) =>
       Effect.scoped(
         Effect.gen(function* () {
           const retriedTurnId = "native-capacity-recovered-parent";
           const retrying = yield* Deferred.make<void>();
-          const harness = yield* makeCodexReplayHarness(
-            makeCodexReplayTranscript({
-              scenario: "capacity-late-child",
-              entries: [
-                ...lateChildPrefix().spawned,
-                {
-                  type: "emit_inbound",
-                  frame: {
-                    method: "turn/completed",
-                    params: {
-                      threadId: RESUME_NATIVE_THREAD,
-                      turn: {
-                        ...makeCodexReplayTurn({ id: RESUME_NATIVE_TURN, status: "failed" }),
-                        error: {
-                          message: "Selected model is at capacity.",
-                          codexErrorInfo: "serverOverloaded",
-                        },
-                      },
+          const entries: Array<CodexReplay.CodexAppServerReplayEntry> = [
+            ...lateChildPrefix().spawned,
+            {
+              type: "emit_inbound",
+              frame: {
+                method: "turn/completed",
+                params: {
+                  threadId: RESUME_NATIVE_THREAD,
+                  turn: {
+                    ...makeCodexReplayTurn({ id: RESUME_NATIVE_TURN, status: "failed" }),
+                    error: {
+                      message: "Selected model is at capacity.",
+                      codexErrorInfo: "serverOverloaded",
                     },
                   },
                 },
-                {
-                  type: "expect_outbound",
-                  frame: {
-                    id: 4,
-                    method: "turn/start",
-                    params: {
-                      threadId: RESUME_NATIVE_THREAD,
-                      input: [],
-                      cwd: "/workspace",
-                      model: "gpt-5.4",
-                      approvalPolicy: "never",
-                      approvalsReviewer: "user",
-                      sandboxPolicy: { type: "dangerFullAccess" },
-                      summary: "detailed",
-                      collaborationMode: { mode: "default", settings: { model: "gpt-5.4" } },
-                    },
+              },
+            },
+            {
+              type: "expect_outbound",
+              frame: {
+                id: 4,
+                method: "turn/start",
+                params: {
+                  threadId: RESUME_NATIVE_THREAD,
+                  input: [],
+                  cwd: "/workspace",
+                  model: "gpt-5.4",
+                  approvalPolicy: "never",
+                  approvalsReviewer: "user",
+                  sandboxPolicy: { type: "dangerFullAccess" },
+                  summary: "detailed",
+                  collaborationMode: { mode: "default", settings: { model: "gpt-5.4" } },
+                },
+              },
+            },
+            ...(parentStatus === "starting" ? [childTurnCompleted(RESUME_CHILD_TURN_1)] : []),
+            {
+              type: "emit_inbound",
+              frame: {
+                id: 4,
+                result: {
+                  turn: makeCodexReplayTurn({ id: retriedTurnId, status: "inProgress" }),
+                },
+              },
+            },
+            {
+              type: "emit_inbound",
+              frame: {
+                method: "turn/started",
+                params: {
+                  threadId: RESUME_NATIVE_THREAD,
+                  turn: makeCodexReplayTurn({ id: retriedTurnId, status: "inProgress" }),
+                },
+              },
+            },
+            {
+              type: "emit_inbound",
+              frame: {
+                method: "turn/completed",
+                params: {
+                  threadId: RESUME_NATIVE_THREAD,
+                  turn: {
+                    ...makeCodexReplayTurn({
+                      id: retriedTurnId,
+                      status:
+                        parentStatus === "starting" || parentStatus === "replied-last"
+                          ? "completed"
+                          : parentStatus,
+                    }),
+                    error:
+                      parentStatus === "failed"
+                        ? { message: "Recovery failed.", codexErrorInfo: "internalServerError" }
+                        : null,
                   },
                 },
-                ...(parentStatus === "starting" ? [childTurnCompleted(RESUME_CHILD_TURN_1)] : []),
-                {
-                  type: "emit_inbound",
-                  frame: {
-                    id: 4,
-                    result: {
-                      turn: makeCodexReplayTurn({ id: retriedTurnId, status: "inProgress" }),
-                    },
-                  },
-                },
-                {
-                  type: "emit_inbound",
-                  frame: {
-                    method: "turn/started",
-                    params: {
-                      threadId: RESUME_NATIVE_THREAD,
-                      turn: makeCodexReplayTurn({ id: retriedTurnId, status: "inProgress" }),
-                    },
-                  },
-                },
-                {
-                  type: "emit_inbound",
-                  frame: {
-                    method: "turn/completed",
-                    params: {
-                      threadId: RESUME_NATIVE_THREAD,
-                      turn: {
-                        ...makeCodexReplayTurn({
-                          id: retriedTurnId,
-                          status: parentStatus === "starting" ? "completed" : parentStatus,
-                        }),
-                        error:
-                          parentStatus === "failed"
-                            ? { message: "Recovery failed.", codexErrorInfo: "internalServerError" }
-                            : null,
-                      },
-                    },
-                  },
-                },
-                childAgentMessage({
-                  id: "child-after-capacity",
-                  text: "CAPACITY_CHILD_DONE",
-                  turnId: RESUME_CHILD_TURN_1,
-                  completedAtMs: 1782622480000,
-                  afterMs: 60_000,
-                }),
-                childTurnCompleted(RESUME_CHILD_TURN_1),
-              ],
+              },
+            },
+            childAgentMessage({
+              id: "child-after-capacity",
+              text: "CAPACITY_CHILD_DONE",
+              turnId: RESUME_CHILD_TURN_1,
+              completedAtMs: 1782622480000,
+              afterMs: 60_000,
             }),
+            childTurnCompleted(RESUME_CHILD_TURN_1),
+          ];
+          if (parentStatus === "replied-last") {
+            entries.push(...entries.splice(lateChildPrefix().spawned.length + 2, 1));
+          }
+          const harness = yield* makeCodexReplayHarness(
+            makeCodexReplayTranscript({ scenario: "capacity-late-child", entries }),
             (event) =>
               event.type === "turn_item.updated" &&
               event.turnItem.type === "error" &&
@@ -5534,8 +5565,11 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             () => harness.subagentUpdates().at(-1)?.subagent.status === "completed",
           );
           yield* harness.awaitTerminal(1);
-          assert.lengthOf(harness.continuationRequests, parentStatus === "completed" ? 1 : 0);
-          if (parentStatus === "completed")
+          assert.lengthOf(
+            harness.continuationRequests,
+            parentStatus === "completed" || parentStatus === "replied-last" ? 1 : 0,
+          );
+          if (parentStatus === "completed" || parentStatus === "replied-last")
             assert.include(harness.continuationRequests[0]?.detail, "CAPACITY_CHILD_DONE");
         }).pipe(
           Effect.provide(

@@ -1991,6 +1991,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             updated.set(input.nativeTurnId, context);
             return updated;
           });
+          if (continuation !== undefined && nativeThreadId != null) {
+            capacityContinuations.delete(nativeThreadId);
+          }
           yield* emitProviderEvent({
             type: "provider_turn.updated",
             driver: CODEX_PROVIDER,
