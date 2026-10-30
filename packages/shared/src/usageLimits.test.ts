@@ -236,6 +236,52 @@ describe("pools", () => {
     expect(accounts[0]?.limits.windows[0]?.usedPercent).toBe(55);
   });
 
+  it("names a hub account after its hub name, which a named native provider still overrides", () => {
+    const hubAccount = {
+      id: "claude-same@example.com.json",
+      driver: claude,
+      email: "same@example.com",
+      name: "Work",
+      usageLimits: { checkedAt, windows: [window] },
+    };
+    const hubOnly = new Map([
+      [
+        EnvironmentId.make("env-a"),
+        {
+          ...laptop,
+          serverConfig: {
+            providers: [],
+            usageLimitSources: [{ ...source, accounts: [hubAccount] }],
+          },
+        },
+      ],
+    ]);
+    expect(collectLimitAccounts(hubOnly)[0]?.displayName).toBe("Work");
+
+    const native = provider({
+      driver: claude,
+      instanceId: ProviderInstanceId.make("claude"),
+      displayName: "Personal",
+      auth: { status: "authenticated", email: "same@example.com" },
+      usageLimits: { checkedAt, windows: [window] },
+    });
+    const both = new Map([
+      [
+        EnvironmentId.make("env-a"),
+        {
+          ...laptop,
+          serverConfig: {
+            providers: [native],
+            usageLimitSources: [{ ...source, accounts: [hubAccount] }],
+          },
+        },
+      ],
+    ]);
+    const accounts = collectLimitAccounts(both);
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]?.displayName).toBe("Personal");
+  });
+
   it("merges OpenCode Go limits from machines with the same API key", () => {
     const go = provider({
       driver: ProviderDriverKind.make("opencode"),
@@ -1096,6 +1142,25 @@ describe("/usage-limits", () => {
       creditId: "hub-credit",
     });
     expect(report?.accounts[0]?.limits.resetCredits?.availableCount).toBe(3);
+  });
+
+  it("names a native account after its hub name unless the provider has its own", () => {
+    const named = sources.map((source) => ({
+      ...source,
+      accounts: source.accounts.map((account) =>
+        account.id === "duplicate" ? { ...account, name: "Work" } : account,
+      ),
+    }));
+    const report = collectProviderUsageLimits(selected.instanceId, [selected], named, now);
+    expect(report?.accounts[0]).toMatchObject({
+      instanceId: selected.instanceId,
+      displayName: "Work",
+      label: `Work [${selected.instanceId}]`,
+    });
+    const own = provider({ ...selected, displayName: "Personal" });
+    expect(
+      collectProviderUsageLimits(own.instanceId, [own], named, now)?.accounts[0]?.displayName,
+    ).toBe("Personal");
   });
 
   it("keeps unidentified custom instances separate, filtering by driver", () => {

@@ -59,6 +59,7 @@ export const UsageLimitSourceAccount = Schema.Struct({
   id: TrimmedNonEmptyString,
   driver: ProviderDriverKind,
   email: Schema.optional(TrimmedNonEmptyString),
+  name: Schema.optional(TrimmedNonEmptyString),
   plan: Schema.optional(TrimmedNonEmptyString),
   workspaceId: Schema.optional(TrimmedNonEmptyString),
   usageLimits: ServerProviderUsageLimits,

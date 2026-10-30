@@ -23,6 +23,7 @@ const AuthFile = Schema.Struct({
   auth_index: Schema.String,
   provider: Schema.String,
   email: Schema.optional(Schema.String),
+  note: Schema.optional(Schema.String),
   disabled: Schema.optional(Schema.Boolean),
   id_token: Schema.optional(
     Schema.Struct({
@@ -260,6 +261,7 @@ export const makeCliproxyApi = Effect.gen(function* () {
       id: account.id,
       driver: ProviderDriverKind.make(account.provider === "codex" ? "codex" : "claudeAgent"),
       ...(account.email ? { email: account.email } : {}),
+      ...(account.note?.trim() ? { name: account.note.trim() } : {}),
       ...(account.id_token?.chatgpt_account_id?.trim()
         ? { workspaceId: account.id_token.chatgpt_account_id.trim() }
         : {}),

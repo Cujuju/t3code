@@ -344,7 +344,7 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
         merge(resolveKey(account) ?? key, {
           key,
           driver: account.driver,
-          displayName: account.email ? null : account.id.replace(/\.json$/i, ""),
+          displayName: account.name ?? (account.email ? null : account.id.replace(/\.json$/i, "")),
           email: account.email,
           plan: account.plan,
           accentColor: undefined,
@@ -806,10 +806,15 @@ export function collectProviderUsageLimits(
     const shownCredits = showHubCredits
       ? hubCredits.account.usageLimits.resetCredits
       : credits?.limits.resetCredits;
+    const displayName =
+      provider.displayName?.trim() ||
+      sources
+        .flatMap((source) => source.accounts)
+        .find((account) => key !== null && account.name && resolveKey(account) === key)?.name;
     accounts.push({
       id: provider.instanceId,
       driver: provider.driver,
-      label: `${provider.displayName?.trim() || String(provider.driver)} [${provider.instanceId}]`,
+      label: `${displayName || String(provider.driver)} [${provider.instanceId}]`,
       ...(provider.auth.label ? { plan: provider.auth.label } : {}),
       instanceId: provider.instanceId,
       resetCreditInput:
@@ -820,7 +825,7 @@ export function collectProviderUsageLimits(
               creditId: hubCreditId,
             }
           : { instanceId: credits?.provider.instanceId ?? provider.instanceId },
-      ...(provider.displayName ? { displayName: provider.displayName } : {}),
+      ...(displayName ? { displayName } : {}),
       ...(provider.accentColor ? { accentColor: provider.accentColor } : {}),
       ...(provider.auth.email ? { email: provider.auth.email } : {}),
       limits: shownCredits ? { ...limits, resetCredits: shownCredits } : limits,
@@ -834,7 +839,8 @@ export function collectProviderUsageLimits(
       accounts.push({
         id: `${source.id}:${account.id}`,
         driver: account.driver,
-        label: `${source.label} · ${account.id}`,
+        label: `${source.label} · ${account.name ?? account.id}`,
+        ...(account.name ? { displayName: account.name } : {}),
         sourceLabel: "CLI Proxy",
         ...(account.usageLimits.resetCredits?.nextCreditId
           ? {
