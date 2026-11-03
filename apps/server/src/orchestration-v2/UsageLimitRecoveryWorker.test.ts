@@ -1,5 +1,12 @@
 import { assert, describe, it } from "@effect/vitest";
-import { RunId, ThreadId, type OrchestrationV2DomainEvent } from "@t3tools/contracts";
+import {
+  CommandId,
+  ProviderInstanceId,
+  RunId,
+  ThreadId,
+  type ServerProviderUsageLimits,
+  type OrchestrationV2DomainEvent,
+} from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -8,6 +15,7 @@ import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -22,10 +30,15 @@ it.effect("idle sweeps skip SQL until the next wake time or a relevant event", (
     const startMs = Date.parse("2026-07-01T09:00:00.000Z");
     const queries = yield* Queue.unbounded<number>();
     const events = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
+    const providerChanges = yield* Queue.unbounded<never[]>();
     const layer = UsageLimitRecoveryWorker.layer.pipe(
       Layer.provide(
         Layer.mergeAll(
           Scheduler.layer,
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: Effect.succeed([]),
+            streamChanges: Stream.fromQueue(providerChanges),
+          }),
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
             getLimitRecoveryCandidates: () =>
               Clock.currentTimeMillis.pipe(
@@ -66,6 +79,9 @@ it.effect("idle sweeps skip SQL until the next wake time or a relevant event", (
       yield* TestClock.adjust("5 seconds");
       // A streaming item at 90s does not wake it; the failed run does on the 95s tick.
       assert.equal(yield* Queue.take(queries), 95_000);
+      yield* Queue.offer(providerChanges, []);
+      yield* TestClock.adjust("5 seconds");
+      assert.equal(yield* Queue.take(queries), 100_000);
     }).pipe(Effect.provide(layer));
   }),
 );
@@ -77,12 +93,13 @@ const failedThread = (failedAgoMs: number, resetAgoMs: number) => {
   const failedAt = DateTime.makeUnsafe(nowMs - failedAgoMs);
   const candidate: ProjectionStore.ProjectionLimitRecoveryCandidate = {
     id: ThreadId.make("thread:limited"),
+    providerInstanceId: ProviderInstanceId.make("codex"),
     status: "failed",
     lastErrorClass: "usage_limit",
     usageLimitResetAt: DateTime.formatIso(DateTime.makeUnsafe(nowMs - resetAgoMs)),
     latestRunId: RunId.make("run:limited"),
     latestRunCompletedAt: failedAt,
-    updatedAt: failedAt,
+    latestRunRequestedAt: failedAt,
     archivedAt: null,
     settledOverride: null,
     pendingRuntimeRequest: null,
@@ -115,4 +132,74 @@ describe("limitRecoveryCommand arming", () => {
     const thread = failedThread(30 * HOUR_MS, 24 * HOUR_MS + 1);
     assert.isNull(limitRecoveryCommand(thread, true, nowMs));
   });
+});
+
+describe("usage-based recovery", () => {
+  const reading = (checkedAt: number, usedPercent: number): ServerProviderUsageLimits => ({
+    checkedAt: DateTime.formatIso(DateTime.makeUnsafe(checkedAt)),
+    windows: [{ id: "weekly", label: "Weekly", kind: "weekly", usedPercent }],
+  });
+  const armedThread = (autoResume: boolean) => {
+    const thread = failedThread(HOUR_MS, -48 * HOUR_MS);
+    return {
+      ...thread,
+      limitRecovery: {
+        runId: thread.latestRunId!,
+        resetAt: thread.usageLimitResetAt!,
+        autoResume,
+        snooze: true,
+        requestId: CommandId.make("recovery:request"),
+      },
+      snoozedUntil: DateTime.makeUnsafe(thread.usageLimitResetAt!),
+    };
+  };
+  it("resumes early with fresh headroom and preserves the continuation identity", () => {
+    const thread = armedThread(true);
+    const command = limitRecoveryCommand(thread, true, nowMs, true, reading(nowMs, 2));
+    assert.equal(command?.type, "message.dispatch");
+    if (command?.type !== "message.dispatch") return;
+    assert.equal(command.text, "Continue where you left off.");
+    const withoutCompletion = {
+      ...thread,
+      latestRunCompletedAt: null,
+      updatedAt: DateTime.makeUnsafe(nowMs + HOUR_MS),
+    };
+    assert.equal(
+      limitRecoveryCommand(withoutCompletion, true, nowMs, true, reading(nowMs, 2))?.type,
+      "message.dispatch",
+    );
+
+    assert.equal(command.usageLimitContinuationOfRunId, thread.latestRunId);
+    assert.equal(
+      command.commandId,
+      limitRecoveryCommand(
+        { ...thread, snoozedUntil: null },
+        true,
+        Date.parse(thread.usageLimitResetAt!),
+        true,
+      )?.commandId,
+    );
+  });
+  it("releases a snooze-only recovery with fresh headroom", () => {
+    const command = limitRecoveryCommand(armedThread(false), false, nowMs, true, reading(nowMs, 2));
+    assert.equal(command?.type, "thread.metadata.update");
+    if (command?.type !== "thread.metadata.update") return;
+    assert.equal(command.limitRecovery?.snooze, false);
+    assert.equal(command.limitRecovery?.autoResume, false);
+  });
+  it.each([true, false])(
+    "keeps autoResume=%s blocked for stale or exhausted readings",
+    (autoResume) => {
+      const thread = armedThread(autoResume);
+      for (const limits of [
+        reading(nowMs - 2 * HOUR_MS, 2),
+        reading(nowMs - HOUR_MS, 2),
+        reading(nowMs, 100),
+        reading(nowMs, 101),
+        { checkedAt: DateTime.formatIso(DateTime.makeUnsafe(nowMs)), windows: [] },
+      ]) {
+        assert.isNull(limitRecoveryCommand(thread, autoResume, nowMs, true, limits));
+      }
+    },
+  );
 });

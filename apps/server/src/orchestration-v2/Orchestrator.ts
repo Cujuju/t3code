@@ -1,3 +1,5 @@
+import { hasUsageLimitHeadroom } from "@t3tools/shared/usageLimits";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import type {
   GuestShareId,
   OrchestrationV2SearchThreadInput,
@@ -382,6 +384,7 @@ export interface OrchestratorV2Shape {
     readonly commandId: CommandId;
     readonly threadId: ThreadId;
     readonly limitRecovery: OrchestrationV2LimitRecoveryUpdate;
+    readonly expectedRecoveryRequestId?: CommandId | undefined;
   }) => Effect.Effect<void, OrchestratorV2Error>;
   readonly searchThreadStream: (
     input: OrchestrationV2SearchThreadInput,
@@ -1048,6 +1051,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const providerAdapters = yield* ProviderAdapterRegistryV2;
+  const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
   const providerSessions = yield* ProviderSessionManagerV2;
   const providerSwitchService = yield* ProviderSwitchServiceV2;
@@ -5425,6 +5429,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const failure = latestRootProviderFailure(run, projection.turnItems);
       const recovery = projection.thread.limitRecovery;
       const now = yield* DateTime.now;
+      const recovered =
+        run != null && Date.parse(recovery?.resetAt ?? "") > DateTime.toEpochMillis(now)
+          ? hasUsageLimitHeadroom(
+              (yield* providerRegistry.getProviders).find(
+                (provider) => provider.instanceId === run.providerInstanceId,
+              )?.usageLimits,
+              DateTime.toEpochMillis(run.completedAt ?? run.requestedAt),
+            )
+          : false;
       if (
         run?.id !== command.usageLimitContinuationOfRunId ||
         failure?.class !== "usage_limit" ||
@@ -5433,14 +5446,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         recovery.requestId !== command.usageLimitRecoveryRequestId ||
         recovery.runId !== run.id ||
         recovery.resetAt !== failure.resetAt ||
-        Date.parse(recovery.resetAt) > DateTime.toEpochMillis(now) ||
+        (Date.parse(recovery.resetAt) > DateTime.toEpochMillis(now) && !recovered) ||
         projection.thread.archivedAt !== null ||
         projection.thread.deletedAt !== null ||
         projection.thread.settledOverride === "settled" ||
         projection.thread.providerInstanceId !== run.providerInstanceId ||
         projection.runtimeRequests.some((request) => request.status === "pending") ||
         (projection.thread.snoozedUntil != null &&
-          DateTime.toEpochMillis(projection.thread.snoozedUntil) > DateTime.toEpochMillis(now))
+          DateTime.toEpochMillis(projection.thread.snoozedUntil) > DateTime.toEpochMillis(now) &&
+          !(
+            recovered &&
+            recovery.snooze &&
+            DateTime.toEpochMillis(projection.thread.snoozedUntil) === Date.parse(recovery.resetAt)
+          ))
       ) {
         yield* emit(
           events,
@@ -5454,8 +5472,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ...(recovery?.autoResume &&
             recovery.requestId === command.usageLimitRecoveryRequestId &&
             recovery.runId === command.usageLimitContinuationOfRunId &&
-            projection.thread.snoozedUntil != null &&
-            DateTime.toEpochMillis(projection.thread.snoozedUntil) > DateTime.toEpochMillis(now)
+            ((projection.thread.snoozedUntil != null &&
+              DateTime.toEpochMillis(projection.thread.snoozedUntil) >
+                DateTime.toEpochMillis(now)) ||
+              (Date.parse(recovery.resetAt) > DateTime.toEpochMillis(now) && !recovered))
               ? { limitRecovery: { ...recovery, requestId: command.commandId } }
               : {}),
           },
@@ -14051,6 +14071,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 (cause) => new OrchestratorProjectionError({ threadId: input.threadId, cause }),
               ),
             );
+          if (!input.limitRecovery.autoResume && !input.limitRecovery.snooze) {
+            const current = thread.limitRecovery;
+            if (
+              current?.runId === input.limitRecovery.runId &&
+              current.resetAt === input.limitRecovery.resetAt &&
+              current.requestId === input.expectedRecoveryRequestId &&
+              !current.autoResume &&
+              current.snooze
+            ) {
+              yield* dispatchWithReceiptEffect({ type: "thread.metadata.update", ...input });
+            }
+            return;
+          }
           // Stop or an explicit recovery choice can commit after the sweep reads its candidate.
           if (
             thread.limitRecovery?.runId === input.limitRecovery.runId &&
@@ -14247,6 +14280,7 @@ export const layer: Layer.Layer<
   | IdAllocator.IdAllocatorV2
   | ProjectStore.ProjectStoreV2
   | ProviderAdapterRegistryV2
+  | ProviderRegistry.ProviderRegistry
   | ProviderSessionManagerV2
   | ProviderSwitchServiceV2
   | ProjectionStoreV2

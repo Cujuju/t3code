@@ -177,11 +177,12 @@ export type ProjectionLimitRecoveryCandidate = Pick<
   | "lastErrorClass"
   | "latestRunId"
   | "usageLimitResetAt"
+  | "providerInstanceId"
   | "archivedAt"
   | "settledOverride"
   | "pendingRuntimeRequest"
   | "latestRunCompletedAt"
-  | "updatedAt"
+  | "latestRunRequestedAt"
   | "limitRecovery"
   | "snoozedUntil"
 >;
@@ -3948,10 +3949,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           readonly payload_json: string;
           readonly run_id: string;
           readonly completed_at: string | null;
+          readonly requested_at: string;
           readonly failure_payload_json: string;
           readonly last_error: string | null;
         }>`
-          SELECT t.payload_json, r.run_id, r.completed_at,
+          SELECT t.payload_json, r.run_id, r.completed_at, r.requested_at,
             item.payload_json AS failure_payload_json,
             (
               SELECT json_extract(session.payload_json, '$.lastError')
@@ -3978,6 +3980,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               latest.ordinal DESC, latest.run_id DESC
             LIMIT 1
           ) AND r.status = 'failed'
+            AND r.provider_instance_id = t.provider_instance_id
           INNER JOIN orchestration_v2_projection_turn_items item ON item.turn_item_id = (
             SELECT error.turn_item_id FROM orchestration_v2_projection_turn_items error
             WHERE error.thread_id = t.thread_id AND error.run_id = r.run_id
@@ -4004,11 +4007,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               (
                 json_extract(t.payload_json, '$.limitRecovery.runId') IS r.run_id
                 AND json_extract(t.payload_json, '$.limitRecovery.resetAt') IS json_extract(item.payload_json, '$.failure.resetAt')
-                AND json_extract(t.payload_json, '$.limitRecovery.autoResume') = 1
-                AND julianday(json_extract(item.payload_json, '$.failure.resetAt')) <= julianday(${DateTime.formatIso(options.now)})
                 AND (
-                  json_extract(t.payload_json, '$.snoozedUntil') IS NULL
-                  OR julianday(json_extract(t.payload_json, '$.snoozedUntil')) <= julianday(${DateTime.formatIso(options.now)})
+                  json_extract(t.payload_json, '$.limitRecovery.autoResume') = 1
+                  OR json_extract(t.payload_json, '$.limitRecovery.snooze') = 1
                 )
               )
               OR (
@@ -4049,10 +4050,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             status: "failed",
             lastErrorClass: summary.lastErrorClass,
             usageLimitResetAt: summary.usageLimitResetAt,
+            providerInstanceId: thread.providerInstanceId,
             latestRunId: RunId.make(row.run_id),
+            latestRunRequestedAt: DateTime.makeUnsafe(row.requested_at),
             latestRunCompletedAt:
               row.completed_at === null ? null : DateTime.makeUnsafe(row.completed_at),
-            updatedAt: thread.updatedAt,
             archivedAt: thread.archivedAt,
             settledOverride: thread.settledOverride,
             pendingRuntimeRequest: null,

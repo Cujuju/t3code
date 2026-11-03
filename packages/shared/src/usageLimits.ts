@@ -624,6 +624,18 @@ export function limitsNotice(limits: ServerProviderUsageLimits): string | null {
   return limits.windows.length === 0 ? "No limits reported." : null;
 }
 
+export function hasUsageLimitHeadroom(
+  limits: ServerProviderUsageLimits | undefined,
+  failedAt: number,
+): boolean {
+  return (
+    limits !== undefined &&
+    limitsNotice(limits) === null &&
+    Date.parse(limits.checkedAt) > failedAt &&
+    !limits.windows.some((window) => window.usedPercent >= 100)
+  );
+}
+
 export function remainingPercent(window: ServerProviderUsageWindow): number {
   return Math.round(100 - Math.max(0, Math.min(100, window.usedPercent)));
 }

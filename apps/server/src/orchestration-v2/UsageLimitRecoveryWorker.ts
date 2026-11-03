@@ -1,4 +1,10 @@
-import { CommandId, MessageId, type OrchestrationV2Command } from "@t3tools/contracts";
+import { hasUsageLimitHeadroom } from "@t3tools/shared/usageLimits";
+import {
+  CommandId,
+  MessageId,
+  type OrchestrationV2Command,
+  type ServerProviderUsageLimits,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -12,6 +18,8 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+
 const MAX_OVERDUE_ARM_MS = 24 * 60 * 60 * 1000;
 
 export function limitRecoveryCommand(
@@ -19,6 +27,7 @@ export function limitRecoveryCommand(
   autoResume: boolean,
   nowMs: number,
   snooze = false,
+  usageLimits?: ServerProviderUsageLimits,
 ): OrchestrationV2Command | null {
   if (
     thread.status !== "failed" ||
@@ -30,13 +39,12 @@ export function limitRecoveryCommand(
     thread.pendingRuntimeRequest !== null
   )
     return null;
+  const failedAt = thread.latestRunCompletedAt ?? thread.latestRunRequestedAt;
+  if (failedAt == null) return null;
+  const failedAtMs = DateTime.toEpochMillis(failedAt);
   const resetMs = Date.parse(thread.usageLimitResetAt);
   // An already-expired window reported with a fresh failure cannot start a retry loop.
-  if (
-    !Number.isFinite(resetMs) ||
-    resetMs <= DateTime.toEpochMillis(thread.latestRunCompletedAt ?? thread.updatedAt)
-  )
-    return null;
+  if (!Number.isFinite(resetMs) || resetMs <= failedAtMs) return null;
   const identity = `${thread.id}:${thread.latestRunId}:${resetMs}`;
   const recovery = thread.limitRecovery;
   if (recovery?.runId !== thread.latestRunId || recovery.resetAt !== thread.usageLimitResetAt) {
@@ -54,13 +62,24 @@ export function limitRecoveryCommand(
       },
     };
   }
+  const recovered = hasUsageLimitHeadroom(usageLimits, failedAtMs);
+  const deliveryIdentity = `${identity}:${recovery.requestId ?? "legacy"}`;
+  if (recovered && !recovery.autoResume && recovery.snooze) {
+    return {
+      type: "thread.metadata.update",
+      commandId: CommandId.make(`limit-release:${deliveryIdentity}`),
+      threadId: thread.id,
+      limitRecovery: { ...recovery, snooze: false },
+    };
+  }
   if (
     !recovery.autoResume ||
-    resetMs > nowMs ||
-    (thread.snoozedUntil != null && DateTime.toEpochMillis(thread.snoozedUntil) > nowMs)
+    (resetMs > nowMs && !recovered) ||
+    (thread.snoozedUntil != null &&
+      DateTime.toEpochMillis(thread.snoozedUntil) > nowMs &&
+      !(recovered && recovery.snooze && DateTime.toEpochMillis(thread.snoozedUntil) === resetMs))
   )
     return null;
-  const deliveryIdentity = `${identity}:${recovery.requestId ?? "legacy"}`;
   return {
     type: "message.dispatch",
     commandId: CommandId.make(`limit-resume:${deliveryIdentity}`),
@@ -92,6 +111,7 @@ const makeSweep = Effect.gen(function* () {
   const threads = yield* ThreadManagement.ThreadManagementService;
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const settings = yield* ServerSettings.ServerSettingsService;
+  const providers = yield* ProviderRegistry.ProviderRegistry;
   const due = DueHint.make();
   yield* forkParked(
     Stream.runForEach(orchestrator.streamDomainEvents, (event) =>
@@ -99,6 +119,7 @@ const makeSweep = Effect.gen(function* () {
     ),
   );
   yield* forkParked(Stream.runForEach(settings.streamChanges, () => due.invalidate));
+  yield* forkParked(Stream.runForEach(providers.streamChanges, () => due.invalidate));
   return Effect.fn("UsageLimitRecoveryWorker.sweep")(function* () {
     const now = yield* DateTime.now;
     const nowMs = DateTime.toEpochMillis(now);
@@ -110,6 +131,7 @@ const makeSweep = Effect.gen(function* () {
       autoResume: preferences.autoResumeLimitedThreads,
       snooze: preferences.snoozeLimitedThreads,
     });
+    const snapshots = yield* providers.getProviders;
     let acted = false;
     for (const thread of candidates) {
       const command = limitRecoveryCommand(
@@ -117,6 +139,8 @@ const makeSweep = Effect.gen(function* () {
         preferences.autoResumeLimitedThreads,
         nowMs,
         preferences.snoozeLimitedThreads,
+        snapshots.find((provider) => provider.instanceId === thread.providerInstanceId)
+          ?.usageLimits,
       );
       if (command === null) continue;
       acted = true;
@@ -126,6 +150,7 @@ const makeSweep = Effect.gen(function* () {
             commandId: command.commandId,
             threadId: command.threadId,
             limitRecovery: command.limitRecovery,
+            expectedRecoveryRequestId: thread.limitRecovery?.requestId,
           });
         } else {
           yield* threads.dispatch(command);

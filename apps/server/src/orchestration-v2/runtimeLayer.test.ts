@@ -1,3 +1,4 @@
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import { limitRecoveryCommand } from "./UsageLimitRecoveryWorker.ts";
@@ -305,6 +306,9 @@ const layerTest = Layer.mergeAll(
   Layer.provide(layerCheckpointStoreTest),
   Layer.provide(layerServerConfig),
   Layer.provide(ServerSettings.layerTest()),
+  Layer.provide(
+    Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+  ),
   Layer.provide(layerTestProviderInstanceRegistry),
   Layer.provide(layerGitWorkflowTest),
   Layer.provide(layerProjectServiceTest),
@@ -318,6 +322,9 @@ const layerLegacyImportTest = Layer.merge(RuntimeLayer.layer, layerProjectionRep
   Layer.provide(layerCheckpointStoreTest),
   Layer.provide(layerServerConfig),
   Layer.provide(ServerSettings.layerTest()),
+  Layer.provide(
+    Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+  ),
   Layer.provide(layerTestProviderInstanceRegistry),
   Layer.provide(layerGitWorkflowTest),
   Layer.provide(layerProjectServiceTest),
@@ -384,6 +391,9 @@ const layerProjectDeletionTest = Layer.mergeAll(
   Layer.provide(layerCheckpointStoreTest),
   Layer.provide(layerServerConfig),
   Layer.provide(ServerSettings.layerTest()),
+  Layer.provide(
+    Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+  ),
   Layer.provide(layerTestProviderInstanceRegistry),
   Layer.provide(layerGitWorkflowTest),
   Layer.provide(layerPlatformTest),
@@ -868,6 +878,9 @@ const layerSharedApplicationDataPlaneTest = Layer.mergeAll(
   Layer.provide(layerCheckpointStoreTest),
   Layer.provide(layerServerConfig),
   Layer.provide(ServerSettings.layerTest()),
+  Layer.provide(
+    Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+  ),
   Layer.provide(layerTestProviderInstanceRegistry),
   Layer.provide(layerGitWorkflowTest),
   Layer.provide(layerPlatformTest),
@@ -7930,6 +7943,7 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
     "independent-patches",
     "expired-snooze",
     "wake",
+    "usage-snooze-release",
     "stop",
     "stop-before-arm",
     "stop-before-arm-mismatched-recovery",
@@ -8079,8 +8093,11 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
         assert.isNull(current.thread.snoozedUntil);
         return;
       }
-      const snooze = scenario === "wake" || scenario === "cancel-resume-keep-snooze";
-      const autoResume = scenario !== "wake";
+      const snooze =
+        scenario === "wake" ||
+        scenario === "usage-snooze-release" ||
+        scenario === "cancel-resume-keep-snooze";
+      const autoResume = scenario !== "wake" && scenario !== "usage-snooze-release";
       const arm = limitRecoveryCommand(shell, autoResume, DateTime.toEpochMillis(now), snooze);
       assert(arm?.type === "thread.metadata.update" && arm.limitRecovery != null);
       const automaticArm = {
@@ -8156,6 +8173,54 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
       });
       if (snooze)
         assert.equal(DateTime.toEpochMillis(armedShell.snoozedUntil!), Date.parse(resetAt));
+      if (scenario === "usage-snooze-release") {
+        const release = limitRecoveryCommand(armedShell, false, DateTime.toEpochMillis(now), true, {
+          checkedAt: DateTime.formatIso(DateTime.add(now, { seconds: 1 })),
+          windows: [{ id: "weekly", label: "Weekly", kind: "weekly", usedPercent: 2 }],
+        });
+        assert(release?.type === "thread.metadata.update" && release.limitRecovery != null);
+        const automaticRelease = {
+          commandId: release.commandId,
+          threadId,
+          limitRecovery: release.limitRecovery,
+          expectedRecoveryRequestId: armedShell.limitRecovery?.requestId,
+        };
+        const choice = {
+          type: "thread.metadata.update",
+          commandId: CommandId.make("recovery:new-choice"),
+          threadId,
+          limitRecovery: { runId: run.id, resetAt, autoResume: true, snooze: true },
+        } as const;
+        yield* orchestrator.dispatch(choice);
+        const before = (yield* orchestrator.getThreadProjection(threadId)).thread;
+        yield* orchestrator.autoArmLimitRecovery(automaticRelease);
+        const after = (yield* orchestrator.getThreadProjection(threadId)).thread;
+        assert.deepEqual(after.limitRecovery, before.limitRecovery);
+        assert.deepEqual(after.snoozedUntil, before.snoozedUntil);
+
+        // A release whose candidate still matches must actually clear the snooze.
+        yield* orchestrator.dispatch({
+          ...choice,
+          commandId: CommandId.make("recovery:snooze-only-again"),
+          limitRecovery: { ...choice.limitRecovery, autoResume: false },
+        });
+        const current = (yield* orchestrator.getThreadProjection(threadId)).thread;
+        yield* orchestrator.autoArmLimitRecovery({
+          ...automaticRelease,
+          commandId: CommandId.make("recovery:matching-release"),
+          expectedRecoveryRequestId: current.limitRecovery?.requestId,
+          limitRecovery: { ...current.limitRecovery!, snooze: false },
+        });
+        const released = (yield* orchestrator.getThreadProjection(threadId)).thread;
+        assert.isFalse(released.limitRecovery!.snooze);
+        assert.isFalse(released.limitRecovery!.autoResume);
+        assert.isNull(released.snoozedUntil);
+        assert.equal(
+          (yield* orchestrator.getShellSnapshot()).threads.find((t) => t.id === threadId)!.status,
+          "failed",
+        );
+        return;
+      }
       if (scenario === "cancel-resume-keep-snooze") {
         yield* TestClock.adjust("10 seconds");
         yield* orchestrator.dispatch({
@@ -8504,6 +8569,9 @@ const layerQueueResumeDisabledInstanceTest = Layer.mergeAll(
         },
       },
     }),
+  ),
+  Layer.provide(
+    Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
   ),
   Layer.provide(layerTestProviderInstanceRegistry),
   Layer.provide(layerGitWorkflowTest),

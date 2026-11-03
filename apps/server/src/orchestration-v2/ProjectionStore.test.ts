@@ -5419,9 +5419,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
             status: sqlShell.status,
             lastErrorClass: sqlShell.lastErrorClass,
             usageLimitResetAt: sqlShell.usageLimitResetAt,
+            providerInstanceId: sqlShell.providerInstanceId,
             latestRunId: sqlShell.latestRunId,
             latestRunCompletedAt: sqlShell.latestRunCompletedAt,
-            updatedAt: sqlShell.updatedAt,
+            latestRunRequestedAt: sqlShell.latestRunRequestedAt,
             archivedAt: sqlShell.archivedAt,
             settledOverride: sqlShell.settledOverride,
             pendingRuntimeRequest: null,
@@ -5594,7 +5595,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       yield* sql`UPDATE orchestration_v2_projection_threads
         SET payload_json = json_set(payload_json, '$.limitRecovery', json(${encodeUnknownJsonString(recovery)}))
         WHERE thread_id = ${threadId}`;
-      assert.isUndefined(
+      assert.isDefined(
         (yield* store.getLimitRecoveryCandidates({ ...recoveryOptions, autoResume: true })).find(
           (row) => row.id === threadId,
         ),
@@ -5618,7 +5619,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       yield* sql`UPDATE orchestration_v2_projection_threads
         SET payload_json = json_set(payload_json, '$.snoozedUntil', ${DateTime.formatIso(DateTime.add(reset, { minutes: 1 }))})
         WHERE thread_id = ${threadId}`;
-      assert.isUndefined(
+      assert.isDefined(
         (yield* store.getLimitRecoveryCandidates({ ...recoveryOptions, now: reset })).find(
           (row) => row.id === threadId,
         ),
