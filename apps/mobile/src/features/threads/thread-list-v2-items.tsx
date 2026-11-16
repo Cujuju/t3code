@@ -1,4 +1,6 @@
 import * as Dialog from "../../components/ui/Dialog";
+import * as Cause from "effect/Cause";
+import type { AccessibilityActionEvent } from "react-native";
 import type { ThreadRowProviderInstance } from "./thread-provider-instance";
 import {
   THREAD_LIST_V2_MONO_FONT as MONO_FONT,
@@ -691,20 +693,31 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   const recede = shouldRecedeThreadRow({ status, selected });
   const timeLabel = props.timeLabel;
 
+  const canOperateThread = useEnvironmentScope(thread.environmentId, AuthOrchestrationOperateScope);
   const visitThread = useAtomCommand(threadEnvironment.visit, { reportFailure: false });
-  const markUnread = useAtomCommand(threadEnvironment.markUnread);
+  const markUnread = useAtomCommand(threadEnvironment.markUnread, { reportFailure: false });
   const readAction = resolveThreadListV2ReadAction(thread);
-  const handleToggleRead = useCallback(() => {
-    if (readAction === null) return;
-    if (readAction === "read") {
-      void visitThread({
-        environmentId: thread.environmentId,
-        input: { threadId: thread.id, visitedAt: thread.updatedAt },
-      });
-    } else {
-      void markUnread({ environmentId: thread.environmentId, input: { threadId: thread.id } });
+  const handleToggleRead = useCallback(async () => {
+    if (!canOperateThread || readAction === null) return;
+    const result =
+      readAction === "read"
+        ? await visitThread({
+            environmentId: thread.environmentId,
+            input: { threadId: thread.id, visitedAt: thread.updatedAt },
+          })
+        : await markUnread({ environmentId: thread.environmentId, input: { threadId: thread.id } });
+    if (result._tag === "Failure") {
+      Dialog.alert(`Could not mark thread ${readAction}`, String(Cause.squash(result.cause)));
     }
-  }, [markUnread, readAction, thread.environmentId, thread.id, thread.updatedAt, visitThread]);
+  }, [
+    canOperateThread,
+    markUnread,
+    readAction,
+    thread.environmentId,
+    thread.id,
+    thread.updatedAt,
+    visitThread,
+  ]);
   const swipeRightAction = useMemo(
     () =>
       readAction === null
@@ -729,13 +742,21 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
     () => [
       ...(prBadgeLabel ? [{ name: "openPullRequests", label: prBadgeLabel }] : []),
       ...(showsWoke ? [{ name: "dismissWoke", label: "Dismiss Woke notification" }] : []),
+      ...(canOperateThread && readAction !== null
+        ? [{ name: "toggleRead", label: `Mark ${readAction}` }]
+        : []),
     ],
-    [prBadgeLabel, showsWoke],
+    [canOperateThread, prBadgeLabel, readAction, showsWoke],
   );
+
+  const handleRowAccessibilityAction = (event: AccessibilityActionEvent) => {
+    if (event.nativeEvent.actionName === "openPullRequests") handleOpenPullRequests();
+    if (event.nativeEvent.actionName === "dismissWoke") handleAcknowledgeWoke();
+    if (event.nativeEvent.actionName === "toggleRead") void handleToggleRead();
+  };
 
   const handleDelete = useCallback(() => onDeleteThread(thread), [onDeleteThread, thread]);
   const handleRename = useCallback(() => onRenameThread(thread), [onRenameThread, thread]);
-  const canOperateThread = useEnvironmentScope(thread.environmentId, AuthOrchestrationOperateScope);
   const handleRegenerateTitle = useCallback(
     () => onRegenerateThreadTitle(thread),
     [onRegenerateThreadTitle, thread],
@@ -1302,10 +1323,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         accessibilityRole="button"
         accessibilityState={{ selected }}
         accessibilityActions={rowAccessibilityActions}
-        onAccessibilityAction={(event) => {
-          if (event.nativeEvent.actionName === "openPullRequests") handleOpenPullRequests();
-          if (event.nativeEvent.actionName === "dismissWoke") handleAcknowledgeWoke();
-        }}
+        onAccessibilityAction={handleRowAccessibilityAction}
         onPress={() => {
           close();
           selectThread();
@@ -1334,6 +1352,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         }
         accessibilityRole="button"
         accessibilityState={{ selected }}
+        accessibilityActions={rowAccessibilityActions}
+        onAccessibilityAction={handleRowAccessibilityAction}
         className={rowAppearance.className}
         onPress={() => {
           close();
