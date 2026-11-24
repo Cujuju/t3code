@@ -4138,3 +4138,133 @@ diff --git a/src/sql/SqlClient.ts b/src/sql/SqlClient.ts
                          services.pipe(
                            Context.add(options.transactionService, level),
                            Context.add(CurrentTransactionService, options.transactionService),
+diff --git a/dist/observability/OtlpExporter.d.ts b/dist/observability/OtlpExporter.d.ts
+index b4f43b5fa8846a76d13874976e2cf77df4ba0e9b..1d3e88ef76fa1fb99361372fe606f00ae5667e5b 100644
+--- a/dist/observability/OtlpExporter.d.ts
++++ b/dist/observability/OtlpExporter.d.ts
+@@ -109,6 +109,9 @@ export declare const make: (options: {
+     readonly exportEmpty?: boolean | undefined;
+     readonly body: (data: Array<any>) => readonly [body: HttpBody, onSuccess: Effect.Effect<void>];
+     readonly shutdownTimeout: Duration.Input;
++    /** Caps pending items and opts into single-flight exports. */
++    readonly maxBufferedItems?: number | undefined;
++    readonly exportTimeout?: Duration.Input | undefined;
+ }) => Effect.Effect<{
+     readonly push: (data: unknown) => void;
+ }, never, Flusher | HttpClient.HttpClient | Scope.Scope>;
+diff --git a/dist/observability/OtlpExporter.js b/dist/observability/OtlpExporter.js
+index f4aae9d15af3ea371005efa5a7173e4528e49daf..a4419fe3267f3acf431a755912e590d85911f44c 100644
+--- a/dist/observability/OtlpExporter.js
++++ b/dist/observability/OtlpExporter.js
+@@ -141,6 +141,12 @@ export const make = /*#__PURE__*/Effect.fnUntraced(function* (options) {
+   });
+   const exportsEmpty = options.maxBatchSize === "disabled" && options.exportEmpty === true;
+   let buffer = [];
++  let overflow = 0;
++  const reportOverflow = Effect.suspend(() => {
++    const count = overflow;
++    overflow = 0;
++    return count === 0 ? Effect.void : Effect.logWarning("Dropped OTLP items because the pending buffer was full", { count });
++  });
+   let disabledUntil = undefined;
+   const isDisabled = () => {
+     if (disabledUntil === undefined) return false;
+@@ -158,22 +164,29 @@ export const make = /*#__PURE__*/Effect.fnUntraced(function* (options) {
+     const batchRequest = HttpClientRequest.setBody(request, body);
+     // Compress before client.execute so transient retries reuse the encoded bytes.
+     const response = options.compression === "gzip" ? HttpClientRequest.compressBody(batchRequest, "gzip").pipe(Effect.flatMap(client.execute)) : client.execute(batchRequest);
+-    return response.pipe(Effect.andThen(onSuccess), Effect.asVoid, Effect.withTracerEnabled(false));
+-  }).pipe(Effect.catchCause(cause => {
++    return reportOverflow.pipe(Effect.andThen(response), Effect.andThen(onSuccess), Effect.asVoid);
++  }).pipe(options.exportTimeout === undefined ? identity : Effect.timeout(options.exportTimeout), Effect.catchCause(cause => {
+     if (disabledUntil !== undefined) return Effect.void;
+     disabledUntil = clock.currentTimeMillisUnsafe() + 60_000;
+     buffer = [];
+-    return Effect.logWarning("Disabling exporter for 60 seconds", cause);
++    return reportOverflow.pipe(Effect.andThen(Effect.logWarning("Disabling exporter for 60 seconds", cause)));
+   }), Effect.annotateLogs({
+     package: "@effect/opentelemetry",
+     module: options.label
+-  }));
++  }), Effect.withTracerEnabled(false));
+   const exportFibers = yield* FiberSet.make();
+   const runExportFork = yield* FiberSet.runtime(exportFibers)();
+-  yield* Scope.addFinalizer(scope, Effect.suspend(() => {
+-    if (disabledUntil !== undefined) return Effect.void;
+-    runExportFork(runExport);
+-    return FiberSet.awaitEmpty(exportFibers);
++  let inFlight;
++  const startExport = options.maxBufferedItems === undefined ? runExportFork : effect => {
++    if (inFlight !== undefined && inFlight.pollUnsafe() === undefined) return inFlight;
++    // Publish the fiber before invoking user serialization or the HTTP client.
++    return inFlight = runExportFork(Effect.andThen(Effect.yieldNow, effect));
++  };
++  yield* Scope.addFinalizer(scope, Effect.gen(function* () {
++    if (inFlight !== undefined) yield* Fiber.await(inFlight);
++    if (isDisabled()) return;
++    startExport(runExport);
++    yield* FiberSet.awaitEmpty(exportFibers);
+   }).pipe(Effect.ignore, Effect.interruptible, Effect.timeoutOption(options.shutdownTimeout)));
+   // `armed` is open while there is something to export. It changes in the
+   // same synchronous step as the buffer check, so a push is never stranded.
+@@ -190,21 +203,29 @@ export const make = /*#__PURE__*/Effect.fnUntraced(function* (options) {
+         wake.closeUnsafe();
+         yield* armed.await;
+         yield* Effect.race(Effect.sleep(exportInterval), wake.await);
+-        yield* Fiber.await(yield* FiberSet.run(exportFibers, runExport));
++        yield* Fiber.await(startExport(runExport));
+         yield* disarmIfEmpty;
+       }
+     }).pipe(Effect.forkIn(scope));
+   }
+   const exportNow = Effect.andThen(runExport, disarmIfEmpty);
+   const flusher = yield* Flusher;
+-  yield* flusher.register(exportNow);
++  yield* flusher.register(options.maxBufferedItems === undefined ? exportNow : Effect.gen(function* () {
++    if (inFlight !== undefined) yield* Fiber.await(inFlight);
++    yield* Fiber.await(startExport(exportNow));
++  }));
+   return {
+     push(data) {
+       // With no idle timer, the next push ends the disabled window.
+       if (isDisabled()) return;
++      if (options.maxBufferedItems !== undefined && buffer.length >= options.maxBufferedItems) {
++        overflow++;
++        return;
++      }
+       buffer.push(data);
++      if (options.maxBufferedItems !== undefined) armed.openUnsafe();
+       if (options.maxBatchSize !== "disabled" && buffer.length >= options.maxBatchSize) {
+-        runExportFork(exportNow);
++        startExport(exportNow);
+       } else {
+         armed.openUnsafe();
+       }
+diff --git a/dist/observability/OtlpTracer.d.ts b/dist/observability/OtlpTracer.d.ts
+index 38dd4401a43e91fab59951986a2800620fb8de28..849e8b1df6881596686f071b060e31314b87e3ac 100644
+--- a/dist/observability/OtlpTracer.d.ts
++++ b/dist/observability/OtlpTracer.d.ts
+@@ -35,6 +35,8 @@ export declare const make: (options: {
+     readonly compression?: "gzip" | "none" | undefined;
+     readonly exportInterval?: Duration.Input | undefined;
+     readonly maxBatchSize?: number | undefined;
++    readonly maxBufferedSpans?: number | undefined;
++    readonly exportTimeout?: Duration.Input | undefined;
+     readonly context?: (<X>(primitive: Tracer.EffectPrimitive<X>, span: Tracer.AnySpan) => X) | undefined;
+     readonly shutdownTimeout?: Duration.Input | undefined;
+ }) => Effect.Effect<Tracer.Tracer, never, Exporter.Flusher | OtlpSerialization | HttpClient.HttpClient | Scope.Scope>;
+diff --git a/dist/observability/OtlpTracer.js b/dist/observability/OtlpTracer.js
+index 1ae907d72ba2fb9920fc87d3561f5b9dad1a707a..01f405a66ebc549ad6d171ded6cdb196b606ac2c 100644
+--- a/dist/observability/OtlpTracer.js
++++ b/dist/observability/OtlpTracer.js
+@@ -64,7 +64,9 @@ export const make = /*#__PURE__*/Effect.fnUntraced(function* (options) {
+       };
+       return [serialization.traces(data), Effect.void];
+     },
+-    shutdownTimeout: options.shutdownTimeout ?? Duration.seconds(3)
++    shutdownTimeout: options.shutdownTimeout ?? Duration.seconds(3),
++    maxBufferedItems: options.maxBufferedSpans,
++    exportTimeout: options.exportTimeout
+   });
+   function exportFn(span) {
+     if (!span.sampled) return;

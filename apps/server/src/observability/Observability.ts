@@ -19,6 +19,9 @@ import * as BrowserTraceCollector from "./BrowserTraceCollector.ts";
 import * as HeapAttribution from "./HeapAttribution.ts";
 import * as OtlpExportFailures from "./OtlpExportFailures.ts";
 
+const OTLP_TRACE_BATCH_SIZE = 1_000;
+const OTLP_TRACE_EXPORT_TIMEOUT = "10 seconds";
+
 export const layer = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
@@ -60,6 +63,9 @@ export const layer = Layer.unwrap(
             : yield* OtlpTracer.make({
                 url: config.otlpTracesUrl,
                 exportInterval: `${traces.exportIntervalMs} millis`,
+                maxBatchSize: OTLP_TRACE_BATCH_SIZE,
+                maxBufferedSpans: OTLP_TRACE_BATCH_SIZE,
+                exportTimeout: OTLP_TRACE_EXPORT_TIMEOUT,
                 headers: traces.headers,
                 resource,
               }).pipe(Effect.provide(OtlpExportFailures.layer("traces")));
