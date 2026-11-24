@@ -7,11 +7,13 @@ import type { NavigationState, PartialState } from "@react-navigation/native";
  * to the NotFound wildcard route on every dev launch.
  */
 export function shouldHandleAppLink(url: string, cloudConfigured: boolean): boolean {
+  // Only the route: a thread link's ?prompt= may mention either lifecycle URL.
+  const route = url.split(/[?#]/)[0] ?? "";
   return (
-    !url.includes("expo-development-client") &&
-    !url.includes("://expo-sharing") &&
+    !route.includes("expo-development-client") &&
+    !route.includes("://expo-sharing") &&
     !/^t3code(-dev|-preview)?:\/*$/.test(url) &&
-    (cloudConfigured || !CLOUD_ONLY_LINK_PATH.test(url.split(/[?#]/)[0] ?? ""))
+    (cloudConfigured || !CLOUD_ONLY_LINK_PATH.test(route))
   );
 }
 
@@ -33,7 +35,14 @@ export function restoreDraftLinkState(
   if (!state || !pathname || !/^new\/draft(?:\/|$)/.test(pathname)) return state;
   const target = state.routes.at(-1);
   if (!target) return state;
-  const draft = target.params ?? {};
+  // The draft screen checks out its branch on mount; the checkout comes from the draft, not the link.
+  const {
+    branch: _branch,
+    worktreePath: _worktreePath,
+    ...draft
+  } = (target.params ?? {}) as {
+    readonly [param: string]: unknown;
+  };
   const routes = state.routes.slice(0, -1);
   routes.push({ name: "Thread", params: { draft } });
   if (pathname !== "new/draft") routes.push(target);
@@ -58,4 +67,59 @@ export function findLinkedRoute(
     if (nested) return nested;
   }
   return undefined;
+}
+
+/**
+ * The last route named `name` (and accepted by `accept`, when given) at any depth of a live
+ * navigation state, with the key of the navigator holding it, so an action can be dispatched as
+ * that screen would. `focused` says whether it is that navigator's current route.
+ */
+export function findStackRoute(
+  state: NavigationState | undefined,
+  name: string,
+  accept?: (params: Readonly<Record<string, unknown>> | undefined) => boolean,
+):
+  | { readonly navigatorKey: string; readonly routeKey: string; readonly focused: boolean }
+  | undefined {
+  if (!state) return undefined;
+  for (let index = state.routes.length - 1; index >= 0; index -= 1) {
+    const route = state.routes[index]!;
+    if (
+      route.name === name &&
+      (accept === undefined ||
+        accept(route.params as Readonly<Record<string, unknown>> | undefined))
+    ) {
+      return { navigatorKey: state.key, routeKey: route.key, focused: index === state.index };
+    }
+    const nested = route.state;
+    // Mounted navigators always have keys; a partial state from a link has not been mounted yet.
+    if (typeof nested?.key === "string") {
+      const found = findStackRoute(nested as NavigationState, name, accept);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
+/** Rewrites the first route named one of `names`, keeping every untouched branch of the state. */
+export function updateLinkedRoute(
+  state: LinkState | undefined,
+  names: ReadonlyArray<string>,
+  update: (route: LinkRoute) => LinkRoute,
+): LinkState | undefined {
+  if (!state) return state;
+  for (const [index, route] of state.routes.entries()) {
+    let next: LinkRoute | undefined;
+    if (names.includes(route.name)) next = update(route);
+    else if (isLinkState(route.state)) {
+      const nested = updateLinkedRoute(route.state, names, update);
+      if (nested !== route.state) next = { ...route, state: nested };
+    }
+    if (next) {
+      const routes = state.routes.slice();
+      routes[index] = next;
+      return { ...state, routes };
+    }
+  }
+  return state;
 }
