@@ -32,10 +32,10 @@ index 213be4fa2647d800b320fa483c9ede801366fd73..bb7a2bb97e976f85af4760a7299db395
   * Result of flattening a pipeline of commands.
   *
 diff --git a/dist/NodeChildProcessSpawner.js b/dist/NodeChildProcessSpawner.js
-index 08d50b16dfe564551f1bffc7cae2d3b53805e172..fbecacc8b39a9eab7725a799aa5019c36bcc32ab 100644
+index 1e1123a7e7f4df662d656d2128cb9f70349a467f..56896254afb897c6f6db6ea1e5ec627d69c0e886 100644
 --- a/dist/NodeChildProcessSpawner.js
 +++ b/dist/NodeChildProcessSpawner.js
-@@ -81,16 +81,26 @@ const isProcessAlive = (command, childProcess) => {
+@@ -82,16 +82,26 @@ const isProcessAlive = (command, childProcess) => {
      return isUnsignallableProcessGroup(error);
    }
  };
@@ -72,7 +72,7 @@ index 08d50b16dfe564551f1bffc7cae2d3b53805e172..fbecacc8b39a9eab7725a799aa5019c3
    const fs = yield* FileSystem.FileSystem;
    const path = yield* Path.Path;
    const resolveWorkingDirectory = Effect.fnUntraced(function* (options) {
-@@ -335,7 +345,7 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+@@ -336,7 +346,7 @@ const make = /*#__PURE__*/Effect.gen(function* () {
    };
    const spawn = (command, spawnOptions) => Effect.callback(resume => {
      const deferred = Deferred.makeUnsafe();
@@ -81,7 +81,7 @@ index 08d50b16dfe564551f1bffc7cae2d3b53805e172..fbecacc8b39a9eab7725a799aa5019c3
      handle.on("error", error => {
        // Node copies the arguments into `spawnargs`.
        if (command.args.some(Redacted.isRedacted)) {
-@@ -665,7 +675,8 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+@@ -676,7 +686,8 @@ const make = /*#__PURE__*/Effect.gen(function* () {
   * @category layers
   * @since 4.0.0
   */
@@ -91,3 +91,90 @@ index 08d50b16dfe564551f1bffc7cae2d3b53805e172..fbecacc8b39a9eab7725a799aa5019c3
  /**
   * Flattens a `Command` into an array of `StandardCommand`s along with pipe
   * options for each connection.
+diff --git a/dist/NodeFileSystem.js b/dist/NodeFileSystem.js
+index 7682ee5849d2bb1f8e6917325d51c9fd99958e57..af5a3dae5464cb805578d724bf65ae50a4917891 100644
+--- a/dist/NodeFileSystem.js
++++ b/dist/NodeFileSystem.js
+@@ -445,50 +445,64 @@ const utimes = /*#__PURE__*/(() => {
+ })();
+ // == watch
+ const watchNode = (path, info, options) => Stream.callback(queue => Effect.acquireRelease(Effect.sync(() => {
+-  const directory = info.type === "Directory" ? path : Path.dirname(path);
++  const isDirectory = info.type === "Directory";
++  const directory = isDirectory ? path : Path.dirname(path);
++  let closed = false;
++  const closeWatcher = (finish = () => Queue.endUnsafe(queue)) => {
++    if (closed) return;
++    closed = true;
++    finish();
++    watcher.close();
++  };
+   const watcher = NFS.watch(path, {
+     recursive: options?.recursive ?? false
+-  }, (event, path) => {
+-    if (!path) return;
++  }, (event, filename) => {
++    if (closed || !filename) return;
+     switch (event) {
+       case "rename":
+         {
+-          Effect.runFork(Effect.matchEffect(stat(Path.resolve(directory, path)), {
+-            onSuccess: _ => Queue.offer(queue, {
+-              _tag: "Create",
+-              path
+-            }),
+-            onFailure: _ => Queue.offer(queue, {
+-              _tag: "Remove",
+-              path
+-            })
+-          }));
++          const windows = process.platform === "win32";
++          // libuv reports the watched directory as absolute and child names as relative.
++          // Close before libuv re-arms its watch on the deleted directory.
++          if (windows && isDirectory && Path.win32.isAbsolute(filename)) {
++            closeWatcher(() => {
++              Queue.offerUnsafe(queue, { _tag: "Remove", path: filename });
++              Queue.endUnsafe(queue);
++            });
++            return;
++          }
++          const entry = (windows ? Path.win32 : Path).resolve(directory, filename);
++          NFS.stat(entry, error => {
++            if (closed) return;
++            Queue.offerUnsafe(queue, { _tag: error ? "Remove" : "Create", path: filename });
++          });
+           return;
+         }
+       case "change":
+         {
+           Queue.offerUnsafe(queue, {
+             _tag: "Update",
+-            path
++            path: filename
+           });
+           return;
+         }
+     }
+   });
+   watcher.on("error", error => {
+-    Queue.failCauseUnsafe(queue, Cause.fail(Error.systemError({
++    closeWatcher(() => Queue.failCauseUnsafe(queue, Cause.fail(Error.systemError({
+       module: "FileSystem",
+       _tag: "Unknown",
+       method: "watch",
+       pathOrDescriptor: path,
+       cause: error
+-    })));
++    }))));
+   });
+   watcher.on("close", () => {
++    closed = true;
+     Queue.endUnsafe(queue);
+   });
+-  return watcher;
+-}), watcher => Effect.sync(() => watcher.close())).pipe(Effect.tap(() => Effect.sync(() => options?.onReady?.()))));
++  return closeWatcher;
++}), closeWatcher => Effect.sync(() => closeWatcher())).pipe(Effect.tap(() => Effect.sync(() => options?.onReady?.()))));
+ const watch = (backend, path, options) => Effect.all([stat(path), Effect.serviceOption(FileSystem.WatchBackend)]).pipe(Effect.map(([stat, callerBackend]) => Option.orElse(callerBackend, () => backend).pipe(Option.flatMap(_ => _.register(path, stat, options)), Option.getOrElse(() => watchNode(path, stat, options)))), Stream.unwrap);
+ // == writeFile
+ const writeFile = (path, data, options) => Effect.callback((resume, signal) => {

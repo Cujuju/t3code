@@ -30,6 +30,7 @@ import type {
 } from "@t3tools/contracts";
 import { DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL } from "@t3tools/contracts";
 import { mergeGitStatusParts } from "@t3tools/shared/git";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 
@@ -1136,33 +1137,38 @@ export const make = Effect.gen(function* () {
     const headPath = yield* workflow.headPath(cwd);
     if (headPath === null) return;
     const headDirectory = path.dirname(headPath);
+    const platform = yield* HostProcess.Platform;
     // Git replaces HEAD by renaming HEAD.lock, which a watch on the file itself would lose.
-    yield* fs
-      .watch(headDirectory, {
-        onReady: () => Deferred.doneUnsafe(ready, Exit.void),
-      })
-      .pipe(
-        // On Windows a watch outlives its deleted directory and reports it ~150k times a second.
-        Stream.takeUntilEffect((event) =>
-          event._tag === "Remove"
-            ? fs.exists(headDirectory).pipe(Effect.map((exists) => !exists))
-            : Effect.succeed(false),
-        ),
-        Stream.filter((event) => path.basename(event.path) === "HEAD"),
-        // On arrival: the cache keeps the old branch until reads below land, and they can retry.
-        Stream.tap(() =>
-          Effect.sync(() => {
-            branchConfirmedUnder.delete(cwd);
-            headGenerations.set(cwd, (headGenerations.get(cwd) ?? 0) + 1);
-          }),
-        ),
-        // A rebase moves HEAD many times; refresh once for whatever arrived during a refresh.
-        Stream.buffer({ capacity: 1, strategy: "sliding" }),
-        Stream.mapEffect(() => retryCheckedOutRef(cwd, publishCheckedOutRef(cwd))),
-        // Detailed status waits behind its own reads; the branch keeps up on the stage above.
-        Stream.buffer({ capacity: 1, strategy: "sliding" }),
-        Stream.runForEach(() => retryCheckedOutRef(cwd, reconcileCheckedOutRef(cwd))),
-      );
+    const events = fs.watch(headDirectory, {
+      onReady: () => Deferred.doneUnsafe(ready, Exit.void),
+    });
+    // Windows terminates in the native callback, before any filesystem probes.
+    const active =
+      platform === "win32"
+        ? events
+        : events.pipe(
+            Stream.takeUntilEffect((event) =>
+              event._tag === "Remove"
+                ? fs.exists(headDirectory).pipe(Effect.map((exists) => !exists))
+                : Effect.succeed(false),
+            ),
+          );
+    yield* active.pipe(
+      Stream.filter((event) => path.basename(event.path) === "HEAD"),
+      // On arrival: the cache keeps the old branch until reads below land, and they can retry.
+      Stream.tap(() =>
+        Effect.sync(() => {
+          branchConfirmedUnder.delete(cwd);
+          headGenerations.set(cwd, (headGenerations.get(cwd) ?? 0) + 1);
+        }),
+      ),
+      // A rebase moves HEAD many times; refresh once for whatever arrived during a refresh.
+      Stream.buffer({ capacity: 1, strategy: "sliding" }),
+      Stream.mapEffect(() => retryCheckedOutRef(cwd, publishCheckedOutRef(cwd))),
+      // Detailed status waits behind its own reads; the branch keeps up on the stage above.
+      Stream.buffer({ capacity: 1, strategy: "sliding" }),
+      Stream.runForEach(() => retryCheckedOutRef(cwd, reconcileCheckedOutRef(cwd))),
+    );
   });
 
   const retainHeadWatcher = Effect.fn("VcsStatusBroadcaster.retainHeadWatcher")(function* (
