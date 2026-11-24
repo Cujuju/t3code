@@ -26,22 +26,21 @@ export function resolveChatCanvasLayout({
   preview,
   padding = 48,
   maxChatWidth = 768,
+  maxHtmlPreviewWidth = maxChatWidth,
   minChatWidth = 640,
   composerHeight = 0,
   detailsCard = null,
   findBar = null,
-  centerBesideDetails = false,
 }: {
   container: PreviewMiniPlayerSize;
   preview: ChatCanvasPreview | null;
   padding?: number;
   maxChatWidth?: number;
+  maxHtmlPreviewWidth?: number;
   minChatWidth?: number;
   composerHeight?: number;
   detailsCard?: PreviewMiniPlayerObstacles["detailsCard"];
   findBar?: PreviewMiniPlayerObstacles["detailsCard"];
-  /** Center the chat in the space left of the details card when it would otherwise crowd it. */
-  centerBesideDetails?: boolean;
 }) {
   const centeredWidth = Math.max(0, Math.min(maxChatWidth, container.width - padding * 2));
   const laneRight = detailsCard
@@ -49,23 +48,7 @@ export function resolveChatCanvasLayout({
     : container.width - padding;
   const normalWidth = Math.max(0, Math.min(centeredWidth, laneRight - padding));
   const canvasCenterLeft = (container.width - normalWidth) / 2;
-  // Beside a card it would crowd, the chat centers between the card and the canvas edge. The shift
-  // eases to zero as clearance grows, so very wide windows keep the chat still and a resize
-  // never jumps it.
-  const besideShift =
-    detailsCard && centerBesideDetails
-      ? Math.min(
-          (container.width - detailsCard.left) / 2,
-          Math.max(
-            0,
-            (container.width - detailsCard.left) / 2 - (laneRight - canvasCenterLeft - normalWidth),
-          ),
-        )
-      : 0;
-  const normalLeft = Math.max(
-    padding,
-    Math.min(canvasCenterLeft - besideShift, laneRight - normalWidth),
-  );
+  const normalLeft = Math.max(padding, Math.min(canvasCenterLeft, laneRight - normalWidth));
   let chat = {
     left: normalLeft,
     width: normalWidth,
@@ -195,5 +178,19 @@ export function resolveChatCanvasLayout({
     frame.x + frame.width > detailsCard.left &&
     frame.y < detailsCard.bottom,
   );
-  return { chat, frame, overlapsChat, overlapsDetailsCard };
+  // A wider HTML preview stays centered on the chat column while that fits, and
+  // clear of the details card and a mini player the chat column sits beside.
+  const laneEnd = frame ? Math.min(laneRight, frame.x - GAP) : laneRight;
+  const htmlPreviewWidth = overlapsChat ? 0 : Math.min(maxHtmlPreviewWidth, laneEnd - padding);
+  const htmlPreview =
+    htmlPreviewWidth > chat.width
+      ? {
+          left: Math.max(
+            padding,
+            Math.min(chat.left + (chat.width - htmlPreviewWidth) / 2, laneEnd - htmlPreviewWidth),
+          ),
+          width: htmlPreviewWidth,
+        }
+      : { left: chat.left, width: chat.width };
+  return { chat, htmlPreview, frame, overlapsChat, overlapsDetailsCard };
 }
