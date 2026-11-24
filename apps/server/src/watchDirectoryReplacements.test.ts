@@ -1,13 +1,160 @@
+// @effect-diagnostics nodeBuiltinImport:off -- Drive the native callback without a Windows host.
+import * as NodeEvents from "node:events";
+import * as NodeFS from "node:fs";
+import * as NodeModule from "node:module";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import { vi } from "vite-plus/test";
 
 import { watchDirectoryPath } from "./watchDirectoryReplacements.ts";
+
+const nativeFs: typeof NodeFS = NodeModule.createRequire(import.meta.url)("node:fs");
+
+class TestWatcher extends NodeEvents.EventEmitter implements NodeFS.FSWatcher {
+  close = vi.fn();
+  ref() {
+    return this;
+  }
+  unref() {
+    return this;
+  }
+}
+
+const stubNativeWatch = Effect.gen(function* () {
+  const ready = yield* Deferred.make<NodeFS.WatchListener<string>>();
+  const watcher = new TestWatcher();
+  yield* Effect.acquireRelease(
+    Effect.sync(() => {
+      const mock = vi
+        .spyOn(nativeFs, "watch")
+        .mockImplementation((_directory: NodeFS.PathLike, options: unknown, listener?: unknown) => {
+          const callback = typeof options === "function" ? options : listener;
+          if (typeof callback !== "function") throw new Error("Missing watch callback");
+          queueMicrotask(() =>
+            Deferred.doneUnsafe(ready, Effect.succeed(callback as NodeFS.WatchListener<string>)),
+          );
+          return watcher;
+        });
+      NodeModule.syncBuiltinESMExports();
+      return mock;
+    }),
+    (mock) =>
+      Effect.sync(() => {
+        mock.mockRestore();
+        NodeModule.syncBuiltinESMExports();
+      }),
+  );
+  return {
+    watcher,
+    ready: Deferred.await(ready),
+    windows: (notify: () => void) => {
+      const platform = Object.getOwnPropertyDescriptor(process, "platform");
+      Object.defineProperty(process, "platform", { value: "win32" });
+      try {
+        notify();
+      } finally {
+        if (platform) Object.defineProperty(process, "platform", platform);
+      }
+    },
+  };
+});
+
+it.live("ends a directory watch synchronously on a Windows self-rename", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const directory = yield* fs.makeTempDirectoryScoped();
+    const { watcher, ready, windows } = yield* stubNativeWatch;
+    const events = yield* fs.watch(directory).pipe(Stream.runCollect, Effect.forkScoped);
+    const notify = yield* ready;
+    const info = NodeFS.statSync(directory);
+    const pending: Array<() => void> = [];
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        const mock = vi.spyOn(nativeFs, "stat").mockImplementation(((
+          _path: NodeFS.PathLike,
+          callback: (error: NodeJS.ErrnoException | null, stats: NodeFS.Stats) => void,
+        ) => {
+          pending.push(() => callback(null, info));
+        }) as typeof NodeFS.stat);
+        NodeModule.syncBuiltinESMExports();
+        return mock;
+      }),
+      (mock) =>
+        Effect.sync(() => {
+          mock.mockRestore();
+          NodeModule.syncBuiltinESMExports();
+        }),
+    );
+    const self = "\\\\?\\UNC\\server\\share\\";
+    windows(() => {
+      notify("rename", "share");
+      assert.strictEqual(watcher.close.mock.calls.length, 0);
+      notify("rename", self);
+      assert.strictEqual(watcher.close.mock.calls.length, 1);
+      assert.lengthOf(pending, 1);
+      notify("rename", self);
+      notify("change", "HEAD");
+    });
+    pending[0]?.();
+    assert.deepEqual(yield* Fiber.join(events), [{ _tag: "Remove", path: self }]);
+    assert.strictEqual(watcher.close.mock.calls.length, 1);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live.each(["file system", "replacement"] as const)(
+  "closes the %s native watch synchronously on error",
+  (kind) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped();
+      const { watcher, ready } = yield* stubNativeWatch;
+      const drain =
+        kind === "file system"
+          ? Stream.runDrain(fs.watch(directory))
+          : Stream.runDrain(
+              watchDirectoryPath(
+                path.join(directory, "themes"),
+                Stream.empty,
+                Effect.succeed(false),
+              ),
+            );
+      yield* drain.pipe(Effect.exit, Effect.forkScoped);
+      yield* ready;
+      watcher.emit("error", new Error("fixture"));
+      assert.strictEqual(watcher.close.mock.calls.length, 1);
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("closes a replacement watch on the parent directory's Windows self-rename", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped();
+    const { watcher, ready } = yield* stubNativeWatch;
+    yield* watchDirectoryPath(
+      path.join(directory, "themes"),
+      Stream.never,
+      Effect.succeed(false),
+    ).pipe(Stream.runDrain, Effect.forkScoped);
+    const notify = yield* ready;
+    notify("rename", "themes");
+    assert.strictEqual(watcher.close.mock.calls.length, 0);
+    notify("rename", "E:\\");
+    notify("rename", "E:\\");
+    assert.strictEqual(watcher.close.mock.calls.length, 1);
+  }).pipe(Effect.provide(NodeServices.layer), Effect.provideService(HostProcess.Platform, "win32")),
+);
 
 it.live.skipIf(!symlinksSupported)(
   "backs off stopped watches for an unchanged linked directory",

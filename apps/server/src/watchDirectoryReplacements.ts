@@ -2,6 +2,7 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveSymlinkTarget } from "@t3tools/shared/symlink";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
@@ -49,22 +50,47 @@ const watchDirectoryEntry = (path: string, ready: Deferred.Deferred<void>) => {
   // Filter in the native callback to avoid queueing and statting unrelated entries.
   return Stream.callback<void, PlatformError.PlatformError>(
     (events) =>
-      Effect.acquireRelease(
-        Effect.try({
-          try: () => {
-            const watcher = NodeFS.watch(directory, (_, filename) => {
-              if (filename === name || filename === null) Queue.offerUnsafe(events, undefined);
-            });
-            watcher.on("error", (error) =>
-              Queue.failCauseUnsafe(events, Cause.fail(watchError(error))),
-            );
-            watcher.on("close", () => Queue.endUnsafe(events));
-            return watcher;
-          },
-          catch: watchError,
-        }),
-        (watcher) => Effect.sync(() => watcher.close()),
-      ).pipe(Effect.tap(() => Deferred.succeed(ready, undefined))),
+      Effect.gen(function* () {
+        const platform = yield* HostProcess.Platform;
+        yield* Effect.acquireRelease(
+          Effect.try({
+            try: () => {
+              let closed = false;
+              const closeWatcher = (finish = () => Queue.endUnsafe(events)) => {
+                if (closed) return;
+                closed = true;
+                finish();
+                watcher.close();
+              };
+              const watcher = NodeFS.watch(directory, (kind, filename) => {
+                if (closed) return;
+                // libuv reports an absolute rename when the watched directory itself is deleted.
+                if (
+                  platform === "win32" &&
+                  kind === "rename" &&
+                  filename &&
+                  NodePath.win32.isAbsolute(filename)
+                ) {
+                  closeWatcher();
+                  return;
+                }
+                if (filename === name || filename === null) Queue.offerUnsafe(events, undefined);
+              });
+              watcher.on("error", (error) =>
+                closeWatcher(() => Queue.failCauseUnsafe(events, Cause.fail(watchError(error)))),
+              );
+              watcher.on("close", () => {
+                closed = true;
+                Queue.endUnsafe(events);
+              });
+              return closeWatcher;
+            },
+            catch: watchError,
+          }),
+          (closeWatcher) => Effect.sync(() => closeWatcher()),
+        );
+        yield* Deferred.succeed(ready, undefined);
+      }),
     { bufferSize: 1, strategy: "sliding" },
   );
 };

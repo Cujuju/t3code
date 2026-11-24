@@ -1,5 +1,12 @@
+// @effect-diagnostics nodeBuiltinImport:off -- Exercise the native watch callback around external Git commands.
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodeModule from "node:module";
+import * as NodePath from "node:path";
+
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import { assert, it, describe } from "@effect/vitest";
+import * as NodeEffectPath from "@effect/platform-node/NodePath";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
@@ -17,6 +24,7 @@ import * as Scheduler from "effect/Scheduler";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as Tracer from "effect/Tracer";
+import { vi } from "vite-plus/test";
 import type {
   BackgroundScope,
   VcsBranchStatus,
@@ -27,6 +35,7 @@ import type {
 } from "@t3tools/contracts";
 import { GitCommandError, GitManagerError } from "@t3tools/contracts";
 import { applyGitStatusStreamEvent } from "@t3tools/shared/git";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import * as VcsAutomaticFetchInterval from "./VcsAutomaticFetchInterval.ts";
 import * as VcsStatusBroadcaster from "./VcsStatusBroadcaster.ts";
@@ -69,38 +78,41 @@ const remoteStatusWithPr: VcsStatusRemoteResult = {
   },
 };
 
-function layerTestFor(state: {
-  currentLocalStatus: VcsStatusLocalResult;
-  currentRemoteStatus: VcsStatusRemoteResult | null;
-  currentDivergence?: Pick<VcsStatusRemoteResult, "aheadCount" | "behindCount">;
-  localStatusCalls: number;
-  remoteStatusCalls: number;
-  localInvalidationCalls: number;
-  remoteInvalidationCalls: number;
-  remoteStatusRefreshUpstreamValues?: Array<boolean | undefined>;
-  remoteStatusReusedDetails?: Array<boolean>;
-  localStatusBranchChanges?: Array<boolean>;
-  refSnapshot?: string | null;
-  worktreeStamp?: string | null;
-  remoteStatusError?: GitManagerError;
-  backgroundWorkEnabled?: boolean;
-  automaticFetchInterval?: Effect.Effect<Duration.Duration>;
-  beforeRemoteStatus?: Effect.Effect<void, GitManagerError>;
-  beforeLocalStatus?: Effect.Effect<void>;
-  beforeCurrentBranch?: Effect.Effect<void>;
-  beforeInvalidate?: Effect.Effect<void>;
-  branchRead?: () => Effect.Effect<string | null, GitCommandError>;
-  fileSystem?: FileSystem.FileSystem;
-  pullCurrentBranch?: GitWorkflowService.GitWorkflowService["Service"]["pullCurrentBranch"];
-  headPath?: string;
-  headPathCalls?: number;
-  failLocalStatus?: boolean;
-  onLocalStatusFailure?: Effect.Effect<void>;
-}) {
+function layerTestFor(
+  state: {
+    currentLocalStatus: VcsStatusLocalResult;
+    currentRemoteStatus: VcsStatusRemoteResult | null;
+    currentDivergence?: Pick<VcsStatusRemoteResult, "aheadCount" | "behindCount">;
+    localStatusCalls: number;
+    remoteStatusCalls: number;
+    localInvalidationCalls: number;
+    remoteInvalidationCalls: number;
+    remoteStatusRefreshUpstreamValues?: Array<boolean | undefined>;
+    remoteStatusReusedDetails?: Array<boolean>;
+    localStatusBranchChanges?: Array<boolean>;
+    refSnapshot?: string | null;
+    worktreeStamp?: string | null;
+    remoteStatusError?: GitManagerError;
+    backgroundWorkEnabled?: boolean;
+    automaticFetchInterval?: Effect.Effect<Duration.Duration>;
+    beforeRemoteStatus?: Effect.Effect<void, GitManagerError>;
+    beforeLocalStatus?: Effect.Effect<void>;
+    beforeCurrentBranch?: Effect.Effect<void>;
+    beforeInvalidate?: Effect.Effect<void>;
+    branchRead?: () => Effect.Effect<string | null, GitCommandError>;
+    fileSystem?: FileSystem.FileSystem;
+    pullCurrentBranch?: GitWorkflowService.GitWorkflowService["Service"]["pullCurrentBranch"];
+    headPath?: string;
+    headPathCalls?: number;
+    failLocalStatus?: boolean;
+    onLocalStatusFailure?: Effect.Effect<void>;
+  },
+  pathLayer = Path.layer,
+) {
   return VcsStatusBroadcaster.layer.pipe(
     Layer.provideMerge(
       state.fileSystem
-        ? Layer.merge(Layer.succeed(FileSystem.FileSystem, state.fileSystem), Path.layer)
+        ? Layer.merge(Layer.succeed(FileSystem.FileSystem, state.fileSystem), pathLayer)
         : NodeServices.layer,
     ),
     Layer.provide(layerBackgroundPolicy(() => state.backgroundWorkEnabled !== false)),
@@ -2382,48 +2394,118 @@ describe("VcsStatusBroadcaster", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("a HEAD watch ends when its git directory is removed", () =>
-    Effect.gen(function* () {
-      const gitDir = "/repo/.git/worktrees/feature";
-      const events = yield* Queue.unbounded<FileSystem.WatchEvent>();
-      const closed = yield* Deferred.make<void>();
-      let gitDirExists = true;
-      const state: Parameters<typeof layerTestFor>[0] = {
-        currentLocalStatus: { ...baseLocalStatus, refName: "main" },
-        currentRemoteStatus: null,
-        localStatusCalls: 0,
-        remoteStatusCalls: 0,
-        localInvalidationCalls: 0,
-        remoteInvalidationCalls: 0,
-        headPath: `${gitDir}/HEAD`,
-        fileSystem: FileSystem.makeNoop({
-          realPath: (target) => Effect.succeed(target),
-          exists: (target) => Effect.succeed(target !== gitDir || gitDirExists),
-          watch: (_target, options) =>
-            Stream.fromQueue(events).pipe(
-              Stream.onStart(Effect.sync(() => options?.onReady?.())),
-              Stream.ensuring(Deferred.succeed(closed, undefined)),
-            ),
-        }),
-      };
+  // The absolute rename event is specific to libuv on Windows.
+  it.live.runIf(HostProcess.Platform.defaultValue() === "win32")(
+    "ends the HEAD watch when external Git removes a linked worktree",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "vcs-watch-remove-" });
+        const repo = path.join(root, "repo");
+        const checkout = path.join(root, "linked");
+        yield* fs.makeDirectory(repo);
+        const git = (...args: ReadonlyArray<string>) =>
+          NodeChildProcess.execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+        git("init", "-q", "-b", "main");
+        yield* fs.writeFileString(path.join(repo, "tracked.txt"), "fixture");
+        git("add", "tracked.txt");
+        git(
+          "-c",
+          "user.name=Test",
+          "-c",
+          "user.email=test@example.invalid",
+          "-c",
+          "commit.gpgsign=false",
+          "commit",
+          "-qm",
+          "fixture",
+        );
+        git("worktree", "add", "-qb", "feature", checkout);
+        const gitDir = path.resolve(
+          git("rev-parse", "--path-format=absolute", "--git-path", "worktrees/linked"),
+        );
+        const headPath = path.join(gitDir, "HEAD");
+        assert.include(yield* fs.readDirectory(gitDir), "HEAD");
+        assert.include(yield* fs.readDirectory(gitDir), "index");
+        yield* fs.open(path.join(checkout, "tracked.txt"));
 
-      yield* Effect.gen(function* () {
-        const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
-        const branches = yield* Stream.toPull(broadcaster.streamBranchStatus({ cwd: "/repo" }));
-        assert.deepEqual(yield* branches, [{ refName: "main", isRepo: true }]);
+        const ended = yield* Deferred.make<void>();
+        const events: FileSystem.WatchEvent[] = [];
+        const nativeFs: typeof NodeFS = NodeModule.createRequire(import.meta.url)("node:fs");
+        const nativeWatch = nativeFs.watch;
+        let selfRenames = 0;
+        let closedInCallback = false;
+        yield* Effect.acquireRelease(
+          Effect.sync(() => {
+            const spy = vi.spyOn(nativeFs, "watch").mockImplementation((...args: unknown[]) => {
+              if (args[0] !== gitDir) return Reflect.apply(nativeWatch, nativeFs, args);
+              const options = args[1] as NodeFS.WatchOptionsWithStringEncoding;
+              const notify = args[2] as NodeFS.WatchListener<string>;
+              const watcher = nativeWatch(gitDir, options, (kind, filename) => {
+                if (kind === "rename" && filename && NodePath.win32.isAbsolute(filename)) {
+                  selfRenames += 1;
+                  notify(kind, filename);
+                  closedInCallback = close.mock.calls.length > 0;
+                  // Keep a red test from feeding the native loop indefinitely.
+                  if (!closedInCallback) watcher.close();
+                } else {
+                  notify(kind, filename);
+                }
+              });
+              const close = vi.spyOn(watcher, "close");
+              return watcher;
+            });
+            NodeModule.syncBuiltinESMExports();
+            return spy;
+          }),
+          (spy) =>
+            Effect.sync(() => {
+              spy.mockRestore();
+              NodeModule.syncBuiltinESMExports();
+            }),
+        );
+        const state: Parameters<typeof layerTestFor>[0] = {
+          currentLocalStatus: { ...baseLocalStatus, refName: "feature" },
+          currentRemoteStatus: null,
+          localStatusCalls: 0,
+          remoteStatusCalls: 0,
+          localInvalidationCalls: 0,
+          remoteInvalidationCalls: 0,
+          headPath,
+          fileSystem: FileSystem.FileSystem.of({
+            ...fs,
+            watch: (target, options) =>
+              fs.watch(target, options).pipe(
+                Stream.tap((event) =>
+                  Effect.sync(() => {
+                    events.push(event);
+                  }),
+                ),
+                Stream.ensuring(Deferred.succeed(ended, undefined)),
+              ),
+          }),
+        };
 
-        // Every checkout removes HEAD.lock, which leaves the watch running.
-        state.currentLocalStatus = { ...baseLocalStatus, refName: "other" };
-        yield* Queue.offer(events, { _tag: "Remove", path: "HEAD.lock" });
-        yield* Queue.offer(events, { _tag: "Update", path: "HEAD" });
-        assert.deepEqual(yield* branches, [{ refName: "other", isRepo: true }]);
+        yield* Effect.gen(function* () {
+          const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+          const branches = yield* Stream.toPull(broadcaster.streamBranchStatus({ cwd: checkout }));
+          assert.deepEqual(yield* branches, [{ refName: "feature", isRepo: true }]);
 
-        // `git worktree remove` deletes the watched directory; Windows keeps reporting it.
-        gitDirExists = false;
-        yield* Queue.offer(events, { _tag: "Remove", path: gitDir });
-        yield* Deferred.await(closed);
-      }).pipe(Effect.provide(layerTestFor(state)), Effect.scoped);
-    }),
+          git("worktree", "remove", checkout);
+          git("worktree", "prune");
+          yield* Deferred.await(ended);
+
+          assert.strictEqual(selfRenames, 1);
+          assert.isTrue(closedInCallback);
+          const removals = events.filter((event) => NodePath.win32.isAbsolute(event.path));
+          assert.lengthOf(removals, 1);
+          assert.strictEqual(removals[0]?._tag, "Remove");
+          assert.strictEqual(events.at(-1), removals[0]);
+          assert.isFalse(yield* fs.exists(gitDir));
+          assert.strictEqual((yield* broadcaster.refreshBranchStatus({ cwd: repo })).isRepo, true);
+        }).pipe(Effect.provide(layerTestFor(state, NodeEffectPath.layer)), Effect.scoped);
+      }).pipe(Effect.provide(NodeServices.layer)),
   );
 
   it.effect("releases remote demand while passive observers remain", () => {
